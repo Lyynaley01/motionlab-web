@@ -5,11 +5,45 @@ const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const production = process.env.NODE_ENV === 'production';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
+const FINDER_TOKEN_SECRET = process.env.FINDER_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+
+function finderTokenKey() {
+  return crypto.createHash('sha256').update(FINDER_TOKEN_SECRET).digest();
+}
+
+function sealFinderPayload(payload) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', finderTokenKey(), iv);
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify(payload), 'utf8'),
+    cipher.final()
+  ]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString('base64url');
+}
+
+function openFinderPayload(token) {
+  if (typeof token !== 'string' || token.length < 40 || token.length > 12000) return null;
+  try {
+    const raw = Buffer.from(token, 'base64url');
+    if (raw.length < 29) return null;
+    const iv = raw.subarray(0, 12);
+    const tag = raw.subarray(12, 28);
+    const encrypted = raw.subarray(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', finderTokenKey(), iv);
+    decipher.setAuthTag(tag);
+    return JSON.parse(Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -259,8 +293,9 @@ app.post('/api/finder', async (req, res) => {
       data.author || author.uniqueId || 'Tidak diketahui'
     ).slice(0, 100);
 
-    // IMPORTANT: Deliberately construct a DTO. Never spread or return `data`.
-    return res.json({
+    // Build the exact DTO needed by the UI, then seal it server-side.
+    // The public /api/finder response only exposes status + an opaque token.
+    const dto = {
       ok: true,
       found: Boolean(data.found ?? true),
       author: safeAuthorName,
@@ -279,10 +314,33 @@ app.post('/api/finder', async (req, res) => {
       comments: normalizedVideo.stats.comments,
       shares: normalizedVideo.stats.shares,
       presetLinks
+    };
+
+    const token = sealFinderPayload({
+      iat: Date.now(),
+      exp: Date.now() + 5 * 60 * 1000,
+      dto
     });
+
+    return res.json({ ok: true, found: dto.found, token });
   } catch (err) {
     return res.status(502).json({ error: safeError(err) });
   }
+});
+
+
+/*
+ * Resolve a previously sealed Finder result.
+ * The browser sees only the opaque token on the initial Finder request;
+ * provider data is never returned by /api/finder itself.
+ */
+app.post('/api/finder/result', (req, res) => {
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+  const sealed = openFinderPayload(token);
+  if (!sealed || !sealed.dto || sealed.exp < Date.now()) {
+    return res.status(410).json({ error: 'Hasil Finder sudah kedaluwarsa. Silakan cari ulang.' });
+  }
+  return res.json(sealed.dto);
 });
 
 
