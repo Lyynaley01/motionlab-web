@@ -128,31 +128,19 @@
     try {
       const data = await api('/api/finder', { url: $('#tiktokUrl').value.trim() });
 
-      /* ── DEBUG: log the full proxy response so you can inspect field names ── */
-      console.log('[AM Finder] raw response:', JSON.stringify(data, null, 2));
-
       if (!data.ok && !data.found && !data.presetLinks && !data.links) {
         throw new Error('Preset tidak ditemukan untuk video ini.');
       }
 
-      /* ── Normalise nested objects ── */
-      const video  = data.video  || data.videoInfo  || data.videoData || {};
-      const author = data.authorDetail || data.authorInfo || data.author_detail || {};
-      /* stats may live at video.stats, video.playCount/diggCount, or top-level */
-      const stats  = video.stats || video.statistics || {
-        views:    video.playCount    ?? video.play_count    ?? data.views    ?? null,
-        likes:    video.diggCount    ?? video.digg_count    ?? data.likes    ?? null,
-        comments: video.commentCount ?? video.comment_count ?? data.comments ?? null,
-      };
+      /* ── Only consume the server's whitelisted DTO. ──
+         The browser must never depend on provider media URLs. */
+      const video  = data.video && typeof data.video === 'object' ? data.video : {};
+      const author = data.authorDetail && typeof data.authorDetail === 'object' ? data.authorDetail : {};
 
-      /* ── TikTok video player + metadata ── */
-      const desc = video.description || video.desc || data.caption || data.description || '';
-      const videoLink = data.videoUrl || data.video_url || video.url || '';
-      const sourceUrl = data.sourceUrl || data.videoUrl || data.video_url || video.url || '';
-      const playUrl = data.videoStreamUrl || video.videoStreamUrl ||
-                      video.playUrlNoWm || video.playUrlNoWatermark ||
-                      video.play_url_no_wm || video.playUrl || video.play_url || '';
-      const coverUrl = video.cover || video.coverUrl || video.thumbnail || '';
+      const desc = video.description || data.caption || '';
+      const videoLink = data.videoUrl || data.sourceUrl || video.url || '';
+      const sourceUrl = data.sourceUrl || data.videoUrl || video.url || '';
+      const coverUrl = video.cover || data.cover || '';
       const videoWidth = Number(video.width || data.videoWidth);
       const videoHeight = Number(video.height || data.videoHeight);
       const videoSection = document.createElement('section');
@@ -335,8 +323,7 @@
          Filter out junk entries whose title is literally "url", "thumb", etc.
          Those are internal API artifacts injected by amfinder, not real presets. */
       const JUNK_TITLES = new Set(['url', 'thumb', 'thumbnail', 'cover', 'image']);
-      const rawLinks = data.presetLinks || data.links || data.presets ||
-                       (Array.isArray(data.data) ? data.data : []);
+      const rawLinks = Array.isArray(data.presetLinks) ? data.presetLinks : [];
       const presetLinks = rawLinks.filter(l => {
         if (!l || !l.url) return false;
         const t = String(l.title || '').toLowerCase().trim();
