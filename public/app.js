@@ -63,22 +63,54 @@
     toast.timer = setTimeout(() => el.classList.remove('show'), 2800);
   }
 
-  let _pt = '';
-
-  (async () => {
-    try {
-      const r = await fetch('/api/_/init');
-      const d = await r.json();
-      _pt = d.pt || '';
-    } catch { _pt = ''; }
-  })();
+  /* ── Page token: single-use, di-fetch fresh setiap kali submit ──
+     Token lama langsung hangus setelah satu request ke /api/_/s.
+     Turnstile token (X-Ts) diambil dari widget kalau tersedia.   */
+  async function getFreshToken() {
+    /* Ambil Turnstile token kalau widget ada di halaman */
+    let tsToken = '';
+    if (window.turnstile) {
+      try {
+        tsToken = await new Promise((resolve, reject) => {
+          const widgetId = window._tsWidgetId;
+          if (widgetId != null) {
+            const t = window.turnstile.getResponse(widgetId);
+            if (t) { window.turnstile.reset(widgetId); resolve(t); return; }
+          }
+          reject(new Error('no widget'));
+        });
+      } catch { tsToken = ''; }
+    }
+    const headers = { 'Accept': 'application/json' };
+    if (tsToken) headers['X-Ts'] = tsToken;
+    const r = await fetch('/api/_/init', { headers });
+    if (!r.ok) throw new Error('Gagal mendapatkan sesi. Muat ulang halaman.');
+    const d = await r.json();
+    if (!d.pt) throw new Error('Token sesi tidak valid.');
+    return d.pt;
+  }
 
   async function api(path, body) {
     const res = await fetch(path, {
-      method:'POST',
-      headers:{'Content-Type':'application/json','Accept':'application/json','X-Pt':_pt},
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(body),
-      credentials:'same-origin'
+      credentials: 'same-origin'
+    });
+    let data;
+    try { data = await res.json(); } catch { data = {}; }
+    if (!res.ok) throw new Error(data.error || 'Permintaan gagal. Coba lagi.');
+    return data;
+  }
+
+  /* apiFinder: ambil fresh token dulu, inject ke header, lalu POST */
+  async function apiFinder(path, body) {
+    const pt  = await getFreshToken();
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Pt': pt },
+      body: JSON.stringify(body),
+      credentials: 'same-origin'
     });
     let data;
     try { data = await res.json(); } catch { data = {}; }
@@ -136,7 +168,7 @@
     finderSubmit.disabled = true;
 
     try {
-      const finderStatus = await api('/api/_/s', { url: $('#tiktokUrl').value.trim() });
+      const finderStatus = await apiFinder('/api/_/s', { url: $('#tiktokUrl').value.trim() });
       if (!finderStatus.token) throw new Error('Hasil Finder tidak tersedia. Coba lagi.');
       const data = await api('/api/_/r', { token: finderStatus.token });
 
