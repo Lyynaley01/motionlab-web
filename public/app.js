@@ -126,7 +126,9 @@
     finderSubmit.disabled = true;
 
     try {
-      const data = await api('/api/finder', { url: $('#tiktokUrl').value.trim() });
+      const finderStatus = await api('/api/finder', { url: $('#tiktokUrl').value.trim() });
+      if (!finderStatus.token) throw new Error('Hasil Finder tidak tersedia. Coba lagi.');
+      const data = await api('/api/finder/result', { token: finderStatus.token });
 
       if (!data.ok && !data.found && !data.presetLinks && !data.links) {
         throw new Error('Preset tidak ditemukan untuk video ini.');
