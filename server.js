@@ -21,7 +21,6 @@ const TURNSTILE_SECRET    = process.env.TURNSTILE_SECRET_KEY || '';
 console.log('=== STARTUP DEBUG ===');
 console.log('NODE_ENV:', process.env.NODE_ENV);
 console.log('PORT:', PORT);
-console.log('ALLOWED_ORIGINS raw:', JSON.stringify(process.env.ALLOWED_ORIGINS));
 console.log('ALLOWED_ORIGINS parsed:', JSON.stringify(allowedOrigins));
 console.log('TURNSTILE_SECRET present?', !!TURNSTILE_SECRET);
 console.log('PAGE_TOKEN_SECRET present?', !!process.env.PAGE_TOKEN_SECRET);
@@ -138,10 +137,9 @@ function blockNonBrowser(req, res, next) {
   const al = req.headers['accept-language'] || '';
   console.log('=== [1] blockNonBrowser ===', {
     path: req.path,
-    ua: ua.slice(0, 80),
-    acceptLanguage: al,
     hasUA: !!ua,
-    hasAL: !!al
+    hasAL: !!al,
+    ua: ua.slice(0, 80)
   });
   if (!ua || /curl|wget|python|axios|node-fetch|httpclient|okhttp|go-http/i.test(ua)) {
     console.log('=== [1] BLOCKED: UA curl/bot ===');
@@ -162,8 +160,7 @@ function requirePageToken(req, res, next) {
     path: req.path,
     hasToken: !!raw,
     tokenLen: raw.length,
-    decoded: payload ? { jti: payload.jti?.slice(0, 8), ip: payload.ip, exp: payload.exp } : null,
-    currentIp: req.ip
+    decoded: payload ? { jti: payload.jti?.slice(0, 8), exp: payload.exp } : null
   });
   if (!payload || payload.exp < Date.now()) {
     console.log('=== [2] BLOCKED: token invalid/expired ===');
@@ -174,7 +171,7 @@ function requirePageToken(req, res, next) {
     return res.status(403).json({ error: 'Token sudah digunakan. Muat ulang halaman.' });
   }
   if (payload.ip && payload.ip !== req.ip) {
-    console.log('=== [2] BLOCKED: IP mismatch ===', { tokenIp: payload.ip, reqIp: req.ip });
+    console.log('=== [2] BLOCKED: IP mismatch ===');
     return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
   }
   usedInitTokens.set(payload.jti, payload.exp);
@@ -244,7 +241,12 @@ app.use(helmet({
 app.use(compression());
 app.use(express.json({ limit: '12kb', strict: true }));
 
-/* ─── Origin guard (diperketat untuk /api/_) ───────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   ORIGIN GUARD (FIXED)
+   ───────────────────────────────────────────────────────────────
+   - Kalau Origin/Referer KOSONG → izinkan (same-origin request)
+   - Kalau ada Origin/Referer → WAJIB cocok dengan ALLOWED_ORIGINS
+   ═══════════════════════════════════════════════════════════════ */
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', req.path.startsWith('/api/') ? 'no-store' : 'public, max-age=300');
 
@@ -252,7 +254,6 @@ app.use((req, res, next) => {
     const origin  = req.get('origin')  || '';
     const referer = req.get('referer') || '';
     const check   = origin || referer;
-    const match   = allowedOrigins.some(o => check.startsWith(o));
 
     console.log('=== [0] ORIGIN GUARD ===', JSON.stringify({
       path: req.path,
@@ -261,16 +262,24 @@ app.use((req, res, next) => {
       referer: referer,
       check: check,
       allowedOrigins: allowedOrigins,
-      allowedCount: allowedOrigins.length,
-      match: match
+      allowedCount: allowedOrigins.length
     }));
 
     if (!allowedOrigins.length) {
       console.log('=== [0] BLOCKED: no ALLOWED_ORIGINS set ===');
       return res.status(503).json({ error: 'Konfigurasi origin belum siap.' });
     }
+
+    /* ── FIX: kalau Origin/Referer KOSONG, izinkan (same-origin request) ── */
+    if (!check) {
+      console.log('=== [0] PASS: no origin header (same-origin) ===');
+      return next();
+    }
+
+    /* ── Kalau ada Origin/Referer, WAJIB cocok ── */
+    const match = allowedOrigins.some(o => check.startsWith(o));
     if (!match) {
-      console.log('=== [0] BLOCKED: origin mismatch ===');
+      console.log('=== [0] BLOCKED: origin mismatch ===', JSON.stringify({ check, allowedOrigins }));
       return res.status(403).json({ error: 'Akses ditolak.' });
     }
     console.log('=== [0] PASS ===');
