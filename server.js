@@ -281,7 +281,12 @@ app.get('/api/finder/video', async (req, res) => {
     const range = typeof req.headers.range === 'string' ? req.headers.range : undefined;
     const media = await axios.get(mediaUrl, {
       responseType: 'stream', timeout: 30000, maxRedirects: 2,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MotionLab/1.0)', ...(range ? { Range: range } : {}) },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36',
+        'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+        'Referer': 'https://www.tiktok.com/',
+        ...(range ? { Range: range } : {})
+      },
       validateStatus: s => (s >= 200 && s < 300) || s === 206
     });
     const contentType = String(media.headers['content-type'] || 'video/mp4').split(';')[0];
