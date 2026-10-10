@@ -10,9 +10,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
-  <!-- ▼▼▼ TURNSTILE SCRIPT (BARU) ▼▼▼ -->
+  <!-- Cloudflare Turnstile -->
   <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-  <!-- ▲▲▲ TURNSTILE SCRIPT ▲▲▲ -->
 </head>
 <body>
   <div class="noise"></div>
@@ -207,10 +206,8 @@
             </div>
             <div class="form-hint"><span>ⓘ</span> Link video publik TikTok, termasuk vt.tiktok.com.</div>
 
-            <!-- ▼▼▼ TURNSTILE WIDGET (BARU) ▼▼▼ -->
-            <!-- GANTI data-sitekey DI BAWAH DENGAN SITE KEY DARI CLOUDFLARE -->
+            <!-- TURNSTILE WIDGET -->
             <div class="cf-turnstile" data-sitekey="0x4AAAAAAFTOhi-DrTt-3jp1" data-theme="dark" data-size="flexible" style="margin: 14px 0;"></div>
-            <!-- ▲▲▲ TURNSTILE WIDGET ▲▲▲ -->
 
             <button class="btn btn-primary btn-wide" id="finderSubmit" type="submit">Find preset <span>⌕</span></button>
           </form>
@@ -277,6 +274,10 @@
                 <input type="checkbox" id="emailConsent" required>
                 <label for="emailConsent">Saya pemilik/pengguna sah email ini dan mengizinkan permintaan verifikasi untuk akun saya sendiri.</label>
               </div>
+
+              <!-- TURNSTILE WIDGET (EMAIL) -->
+              <div class="cf-turnstile" data-sitekey="0x4AAAAAAFTOhi-DrTt-3jp1" data-theme="dark" data-size="flexible" style="margin: 14px 0;"></div>
+
               <button class="btn btn-primary btn-wide" id="sendLinkBtn" type="submit">Send verification link <span>↗</span></button>
             </form>
 
@@ -284,6 +285,10 @@
               <label for="magicLink">FULL MAGIC LINK</label>
               <textarea id="magicLink" rows="3" maxlength="4096" placeholder="https://… (paste link dari email resmi)" required></textarea>
               <div class="form-hint"><span>⌑</span> Link bersifat rahasia. Jangan bagikan atau kirim ke siapa pun.</div>
+
+              <!-- TURNSTILE WIDGET (MAGIC LINK) -->
+              <div class="cf-turnstile" data-sitekey="0x4AAAAAAFTOhi-DrTt-3jp1" data-theme="dark" data-size="flexible" style="margin: 14px 0;"></div>
+
               <div class="button-row">
                 <button type="button" class="btn btn-ghost" id="backEmail">← Back</button>
                 <button class="btn btn-primary" id="verifyBtn" type="submit">Verify link <span>↗</span></button>
