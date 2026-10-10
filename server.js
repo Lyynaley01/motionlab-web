@@ -12,6 +12,8 @@ const PORT = Number(process.env.PORT || 3000);
 const production = process.env.NODE_ENV === 'production';
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
 const FINDER_TOKEN_SECRET = process.env.FINDER_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+const PAGE_TOKEN_SECRET   = process.env.PAGE_TOKEN_SECRET   || crypto.randomBytes(32).toString('hex');
+const PAGE_TOKEN_TTL_MS   = 30 * 60 * 1000;
 
 function finderTokenKey() {
   return crypto.createHash('sha256').update(FINDER_TOKEN_SECRET).digest();
@@ -44,6 +46,44 @@ function openFinderPayload(token) {
   }
 }
 
+
+function pageTokenKey() {
+  return crypto.createHash('sha256').update(PAGE_TOKEN_SECRET).digest();
+}
+
+function sealPageToken(payload) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', pageTokenKey(), iv);
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify(payload), 'utf8'),
+    cipher.final()
+  ]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString('base64url');
+}
+
+function openPageToken(token) {
+  if (typeof token !== 'string' || token.length < 40 || token.length > 2048) return null;
+  try {
+    const raw     = Buffer.from(token, 'base64url');
+    if (raw.length < 29) return null;
+    const iv      = raw.subarray(0, 12);
+    const tag     = raw.subarray(12, 28);
+    const enc     = raw.subarray(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', pageTokenKey(), iv);
+    decipher.setAuthTag(tag);
+    return JSON.parse(Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8'));
+  } catch { return null; }
+}
+
+function requirePageToken(req, res, next) {
+  const raw     = typeof req.headers['x-pt'] === 'string' ? req.headers['x-pt'] : '';
+  const payload = openPageToken(raw);
+  if (!payload || payload.exp < Date.now()) {
+    return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
+  }
+  next();
+}
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -90,7 +130,7 @@ function ampremLimit(req, res, next) {
   next();
 }
 app.use('/api', (req, res, next) => {
-  if (req.path === '/finder' || req.path === '/finder/video') return next();
+  if (req.path === '/_/s' || req.path === '/_/v' || req.path === '/_/init') return next();
   return baseLimit(req, res, next);
 });
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'], index: 'index.html' }));
@@ -149,6 +189,18 @@ function resolveVideoMediaUrl(video = {}, data = {}) {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'Alight Motion Hub', status: 'online' }));
 
+/* Issue a short-lived session token bound to this client.
+   Called once on page load — endpoint name reveals nothing about finder. */
+app.get('/api/_/init', (req, res) => {
+  const token = sealPageToken({
+    ip:  req.ip || '',
+    ua:  (req.headers['user-agent'] || '').slice(0, 200),
+    iat: Date.now(),
+    exp: Date.now() + PAGE_TOKEN_TTL_MS
+  });
+  return res.json({ pt: token });
+});
+
 // Amprem V2 proxy: email and magic link are never written to logs or persisted.
 app.post('/api/amprem/send-link', ampremLimit, async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
@@ -186,7 +238,7 @@ app.post('/api/amprem/verify-link', ampremLimit, async (req, res) => {
   }
 });
 
-app.post('/api/finder', async (req, res) => {
+app.post('/api/_/s', requirePageToken, async (req, res) => {
   const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'Masukkan URL video TikTok HTTPS yang valid.' });
 
@@ -294,7 +346,7 @@ app.post('/api/finder', async (req, res) => {
     ).slice(0, 100);
 
     // Build the exact DTO needed by the UI, then seal it server-side.
-    // The public /api/finder response only exposes status + an opaque token.
+    // The public /api/_/s response only exposes status + an opaque token.
     const dto = {
       ok: true,
       found: Boolean(data.found ?? true),
@@ -332,9 +384,9 @@ app.post('/api/finder', async (req, res) => {
 /*
  * Resolve a previously sealed Finder result.
  * The browser sees only the opaque token on the initial Finder request;
- * provider data is never returned by /api/finder itself.
+ * provider data is never returned by /api/_/s itself.
  */
-app.post('/api/finder/result', (req, res) => {
+app.post('/api/_/r', requirePageToken, (req, res) => {
   const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
   const sealed = openFinderPayload(token);
   if (!sealed || !sealed.dto || sealed.exp < Date.now()) {
@@ -346,7 +398,7 @@ app.post('/api/finder/result', (req, res) => {
 
 /* Stream the provider's MP4 through our own origin so the browser never
    has to request an expiring provider URL directly. */
-app.get('/api/finder/video', async (req, res) => {
+app.get('/api/_/v', async (req, res) => {
   const url = typeof req.query?.url === 'string' ? req.query.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'URL video TikTok tidak valid.' });
   try {
