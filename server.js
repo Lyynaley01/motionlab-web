@@ -1,11 +1,11 @@
 require('dotenv').config();
-const express    = require('express');
-const axios      = require('axios');
-const helmet     = require('helmet');
+const express     = require('express');
+const axios       = require('axios');
+const helmet      = require('helmet');
 const compression = require('compression');
-const rateLimit  = require('express-rate-limit');
-const path       = require('path');
-const crypto     = require('crypto');
+const rateLimit   = require('express-rate-limit');
+const path        = require('path');
+const crypto      = require('crypto');
 
 const app        = express();
 const PORT       = Number(process.env.PORT || 3000);
@@ -14,16 +14,14 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x
 
 /* ─── Secrets ──────────────────────────────────────────────────── */
 const FINDER_TOKEN_SECRET = process.env.FINDER_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
-const PAGE_TOKEN_SECRET   = process.env.PAGE_TOKEN_SECRET   || '16fbcd07055375d9b7a3d6426df80fce9417b49f42576e9af380389c26242107';
+const PAGE_TOKEN_SECRET   = process.env.PAGE_TOKEN_SECRET   || crypto.randomBytes(32).toString('hex');
 const TURNSTILE_SECRET    = process.env.TURNSTILE_SECRET_KEY || '';
 
 /* TTL: init token hidup 15 menit, sekali pakai */
 const INIT_TOKEN_TTL_MS = 15 * 60 * 1000;
 
-/* ─── Used-token store (single-use nonce) ───────────────────────
-   Menyimpan jti (token id) yang sudah dipakai.
-   Di-prune otomatis setiap 20 menit agar ga bocor memori. */
-const usedInitTokens = new Map(); // jti → expiresAt
+/* ─── Used-token store (single-use nonce) ─────────────────────── */
+const usedInitTokens = new Map();
 setInterval(() => {
   const now = Date.now();
   for (const [jti, exp] of usedInitTokens) {
@@ -32,15 +30,16 @@ setInterval(() => {
 }, 20 * 60 * 1000);
 
 /* ─── Rate limiters ─────────────────────────────────────────────
-   /api/_/init: max 8 token per IP per 10 menit
-   endpoint finder /_/s: max 20 per IP per 15 menit
-   semua endpoint lain: 30 per 15 menit                          */
+   /api/_/init: max 3 token per IP+UA per 15 menit (diperketat)
+   /api/_/s: max 20 per IP per 15 menit
+   endpoint lain: 30 per 15 menit                                  */
 const initLimit = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  limit: 8,
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  message: { error: 'Terlalu banyak permintaan token. Coba lagi nanti.' }
+  keyGenerator: (req) => `${req.ip}:${(req.headers['user-agent'] || '').slice(0, 50)}`,
+  message: { error: 'Batas sesi tercapai. Coba lagi nanti.' }
 });
 
 const finderLimit = rateLimit({
@@ -124,29 +123,42 @@ function openPageToken(token) {
   } catch { return null; }
 }
 
-/* ─── Middleware: validasi page token + single-use check ─────────
-   Token dari /api/_/init hanya boleh dipakai SATU KALI.
-   Kalau orang coba loop curl dengan token yang sama → 403.        */
+/* ─── Middleware: blokir curl/wget/python/UA kosong ─────────────
+   Browser asli selalu kirim User-Agent + Accept-Language.
+   curl/wget/axios/python-requests biasanya kosong atau pola khas. */
+function blockNonBrowser(req, res, next) {
+  const ua = req.headers['user-agent'] || '';
+  if (!ua || /curl|wget|python|axios|node-fetch|httpclient|okhttp|go-http/i.test(ua)) {
+    return res.status(403).json({ error: 'Akses ditolak.' });
+  }
+  if (!req.headers['accept-language']) {
+    return res.status(403).json({ error: 'Akses ditolak.' });
+  }
+  next();
+}
+
+/* ─── Middleware: validasi page token + single-use + IP check ──── */
 function requirePageToken(req, res, next) {
   const raw     = typeof req.headers['x-pt'] === 'string' ? req.headers['x-pt'] : '';
   const payload = openPageToken(raw);
   if (!payload || payload.exp < Date.now()) {
     return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
   }
-  /* single-use: tolak kalau jti sudah pernah dipakai */
   if (!payload.jti || usedInitTokens.has(payload.jti)) {
     return res.status(403).json({ error: 'Token sudah digunakan. Muat ulang halaman.' });
   }
-  /* tandai sebagai sudah dipakai */
+  if (payload.ip && payload.ip !== req.ip) {
+    return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
+  }
   usedInitTokens.set(payload.jti, payload.exp);
   next();
 }
 
-/* ─── Middleware: Cloudflare Turnstile ──────────────────────────
-   Hanya aktif kalau TURNSTILE_SECRET_KEY di-set di env.
-   Client wajib kirim header X-Ts berisi cf-turnstile-response.  */
+/* ─── Middleware: Cloudflare Turnstile ────────────────────────── */
 async function requireTurnstile(req, res, next) {
-  if (!TURNSTILE_SECRET) return next(); /* dev mode: skip */
+  if (!TURNSTILE_SECRET) {
+    return res.status(503).json({ error: 'Verifikasi belum dikonfigurasi.' });
+  }
   const cfToken = typeof req.headers['x-ts'] === 'string' ? req.headers['x-ts'] : '';
   if (!cfToken) return res.status(403).json({ error: 'Verifikasi diperlukan.' });
   try {
@@ -188,22 +200,28 @@ app.use(helmet({
 app.use(compression());
 app.use(express.json({ limit: '12kb', strict: true }));
 
-/* ─── Origin guard ──────────────────────────────────────────────── */
+/* ─── Origin guard (diperketat untuk /api/_) ───────────────────── */
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', req.path.startsWith('/api/') ? 'no-store' : 'public, max-age=300');
-  const origin = req.get('origin');
-  if (origin && allowedOrigins.length && !allowedOrigins.includes(origin))
-    return res.status(403).json({ error: 'Origin tidak diizinkan.' });
-  if (origin && !allowedOrigins.length && production && !origin.startsWith('https://'))
-    return res.status(403).json({ error: 'Gunakan koneksi HTTPS.' });
+
+  if (req.path.startsWith('/api/_')) {
+    const origin = req.get('origin') || req.get('referer') || '';
+    if (!allowedOrigins.length) {
+      // kalau env belum di-set, tolak request API agar aman by default
+      return res.status(503).json({ error: 'Konfigurasi origin belum siap.' });
+    }
+    if (!allowedOrigins.some(o => origin.startsWith(o))) {
+      return res.status(403).json({ error: 'Akses ditolak.' });
+    }
+  }
   next();
 });
 
 /* ─── Rate limit router ─────────────────────────────────────────── */
 app.use('/api', (req, res, next) => {
-  if (req.path === '/_/init') return next(); /* initLimit dipasang langsung di route */
-  if (req.path === '/_/s')    return next(); /* finderLimit dipasang langsung di route */
-  if (req.path === '/_/v')    return next(); /* no limit — video proxy */
+  if (req.path === '/_/init') return next();
+  if (req.path === '/_/s')    return next();
+  if (req.path === '/_/v')    return next();
   return baseLimit(req, res, next);
 });
 
@@ -265,12 +283,9 @@ app.get('/api/health', (_req, res) =>
   res.json({ ok: true, service: 'Alight Motion Hub', status: 'online' })
 );
 
-/* ── Init: issue single-use page token ──────────────────────────
-   Dilindungi Turnstile (kalau env di-set) + rate limit ketat.
-   Token mengandung jti (random nonce) yang di-blacklist setelah
-   satu kali pakai — tidak bisa di-loop pakai token yang sama.   */
-app.get('/api/_/init', initLimit, requireTurnstile, (req, res) => {
-  const jti   = crypto.randomBytes(16).toString('hex'); // unique nonce
+/* ── Init: issue single-use page token ────────────────────────── */
+app.get('/api/_/init', initLimit, blockNonBrowser, requireTurnstile, (req, res) => {
+  const jti = crypto.randomBytes(16).toString('hex');
   const token = sealPageToken({
     jti,
     ip:  req.ip || '',
@@ -318,10 +333,8 @@ app.post('/api/amprem/verify-link', ampremLimit, async (req, res) => {
   } catch (err) { return res.status(502).json({ error: safeError(err) }); }
 });
 
-/* ── AM Finder: step 1 ───────────────────────────────────────────
-   requirePageToken mengkonsumsi token (single-use).
-   finderLimit membatasi 20 pencarian per IP per 15 menit.        */
-app.post('/api/_/s', finderLimit, requirePageToken, async (req, res) => {
+/* ── AM Finder: step 1 ──────────────────────────────────────────── */
+app.post('/api/_/s', finderLimit, blockNonBrowser, requirePageToken, async (req, res) => {
   const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'Masukkan URL video TikTok HTTPS yang valid.' });
 
@@ -418,9 +431,7 @@ app.post('/api/_/s', finderLimit, requirePageToken, async (req, res) => {
   } catch (err) { return res.status(502).json({ error: safeError(err) }); }
 });
 
-/* ── AM Finder: step 2 — resolve sealed token ───────────────────
-   Tidak butuh page token baru — finder token itu sendiri
-   sudah terenkripsi dan expire dalam 5 menit.                    */
+/* ── AM Finder: step 2 ──────────────────────────────────────────── */
 app.post('/api/_/r', (req, res) => {
   const token  = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
   const sealed = openFinderPayload(token);
