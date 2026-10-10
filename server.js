@@ -155,87 +155,122 @@ app.post('/api/amprem/verify-link', ampremLimit, async (req, res) => {
 app.post('/api/finder', async (req, res) => {
   const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'Masukkan URL video TikTok HTTPS yang valid.' });
+
   try {
+    // Provider is contacted server-side only. Its raw response is NEVER returned.
     const upstream = await axios.get(process.env.AM_FINDER_URL, {
-      params: { url }, timeout: 30000, maxRedirects: 0,
-      headers: { Accept: 'text/event-stream, application/json, text/plain, */*', 'User-Agent': 'AlightMotionHub/1.0' },
-      responseType: 'text', maxContentLength: 2 * 1024 * 1024,
+      params: { url },
+      timeout: 30000,
+      maxRedirects: 0,
+      headers: {
+        Accept: 'text/event-stream, application/json, text/plain, */*',
+        'User-Agent': 'AlightMotionHub/1.0'
+      },
+      responseType: 'text',
+      maxContentLength: 2 * 1024 * 1024,
       validateStatus: s => s >= 200 && s < 300
     });
+
     const raw = String(upstream.data || '').trim();
     let data = null;
-    try { data = JSON.parse(raw); } catch {
-      const lines = raw.split(/\r?\n/); let event = '';
+
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      const lines = raw.split(/\r?\n/);
+      let event = '';
       for (const line of lines) {
-        if (line.startsWith('event:')) event = line.slice(6).trim();
-        else if (line.startsWith('data:') && (!event || event === 'result')) {
-          try { const parsed = JSON.parse(line.slice(5).trim()); if (parsed && typeof parsed === 'object') data = parsed; } catch {}
+        if (line.startsWith('event:')) {
+          event = line.slice(6).trim();
+        } else if (line.startsWith('data:') && (!event || event === 'result')) {
+          try {
+            const parsed = JSON.parse(line.slice(5).trim());
+            if (parsed && typeof parsed === 'object') data = parsed;
+          } catch {}
         }
       }
     }
-    if (!data || typeof data !== 'object') return res.status(502).json({ error: 'Format respons layanan finder tidak dikenali.' });
-    const links = [];
-    const seen = new Set();
-    const walk = value => {
-      if (!value || typeof value !== 'object') return;
-      if (Array.isArray(value)) return value.forEach(walk);
-      for (const [key, child] of Object.entries(value)) {
-        if (child && typeof child === 'object') walk(child);
-        else if (typeof child === 'string' && /^https:\/\//i.test(child) && /(preset|alight|\.xml(?:\?|$)|project|5mb)/i.test(`${key} ${child}`)) {
-          try { const u = new URL(child); if (!seen.has(u.href)) { seen.add(u.href); links.push({ title: key.replace(/[_-]/g, ' ').slice(0, 80) || 'Preset', url: u.href }); } } catch {}
-        }
-      }
-    };
-    walk(data);
-    // Prefer the provider's explicit presetLinks array and its labels.
-    if (Array.isArray(data.presetLinks)) {
-      for (const item of data.presetLinks) {
-        if (!item?.url) continue;
-        try { const u = new URL(item.url); if (u.protocol === 'https:' && !seen.has(u.href)) { seen.add(u.href); links.unshift({ title: String(item.title || item.type || 'Preset').slice(0, 80), type: String(item.type || '').slice(0, 30), url: u.href, size: item.size ? String(item.size).slice(0, 30) : null }); } } catch {}
-      }
+
+    if (!data || typeof data !== 'object') {
+      return res.status(502).json({ error: 'Format respons layanan finder tidak dikenali.' });
     }
-    if (!links.length) return res.status(404).json({ error: 'Preset tidak ditemukan pada video ini.' });
+
     const video = data.video && typeof data.video === 'object' ? data.video : {};
-    const author = data.authorDetail && typeof data.authorDetail === 'object' ? data.authorDetail : {};
-    const videoUrl = validHttpsUrl(video.url || data.videoUrl || url) ? (video.url || data.videoUrl || url) : url;
-    const videoStreamUrl = resolveVideoMediaUrl(video, data);
+    const author = data.authorDetail && typeof data.authorDetail === 'object'
+      ? data.authorDetail
+      : {};
+
+    // Only expose preset links required by the UI.
+    const presetLinks = [];
+    const seen = new Set();
+
+    if (Array.isArray(data.presetLinks)) {
+      for (const item of data.presetLinks.slice(0, 12)) {
+        if (!item || typeof item !== 'object' || typeof item.url !== 'string') continue;
+
+        try {
+          const u = new URL(item.url);
+          if (u.protocol !== 'https:' || seen.has(u.href)) continue;
+          seen.add(u.href);
+
+          presetLinks.push({
+            title: String(item.title || item.type || 'Preset').slice(0, 80),
+            type: String(item.type || '').slice(0, 30),
+            url: u.href,
+            size: item.size ? String(item.size).slice(0, 30) : null,
+            ratio: item.ratio ? String(item.ratio).slice(0, 20) : null,
+            thumb: httpsMediaUrl(item.thumb)
+          });
+        } catch {}
+      }
+    }
+
+    if (!presetLinks.length) {
+      return res.status(404).json({ error: 'Preset tidak ditemukan pada video ini.' });
+    }
+
+    const videoUrlCandidate = video.url || data.videoUrl || url;
+    const videoUrl = validHttpsUrl(videoUrlCandidate) ? videoUrlCandidate : url;
+
     const normalizedVideo = {
       id: video.id == null ? null : String(video.id).slice(0, 80),
       url: videoUrl,
       description: String(video.description || video.desc || data.caption || '').slice(0, 1200),
-      createTime: video.createTime ?? null,
       stats: {
-        views: video.stats?.views ?? null,
-        likes: video.stats?.likes ?? null,
-        comments: video.stats?.comments ?? null,
-        shares: video.stats?.shares ?? null
+        views: video.stats?.views == null ? null : Number(video.stats.views),
+        likes: video.stats?.likes == null ? null : Number(video.stats.likes),
+        comments: video.stats?.comments == null ? null : Number(video.stats.comments),
+        shares: video.stats?.shares == null ? null : Number(video.stats.shares)
       },
+      // Poster only. MP4 URLs are intentionally excluded from this DTO.
       cover: httpsMediaUrl(video.cover || video.coverUrl || video.thumbnail),
-      playUrl: httpsMediaUrl(video.playUrl || video.play_url),
-      playUrlNoWm: httpsMediaUrl(video.playUrlNoWm || video.playUrlNoWatermark || video.play_url_no_wm),
-      videoStreamUrl,
       width: Number.isFinite(Number(video.width)) ? Number(video.width) : null,
       height: Number.isFinite(Number(video.height)) ? Number(video.height) : null
     };
-    const normalizedLinks = (Array.isArray(data.presetLinks) ? data.presetLinks : []).slice(0, 12).map(item => ({
-      title: String(item?.title || item?.type || 'Preset').slice(0, 80),
-      type: String(item?.type || '').slice(0, 30),
-      url: httpsMediaUrl(item?.url),
-      size: item?.size ? String(item.size).slice(0, 30) : null,
-      ratio: item?.ratio ? String(item.ratio).slice(0, 20) : null,
-      thumb: httpsMediaUrl(item?.thumb)
-    })).filter(item => item.url);
-    return res.json({
-      ok: true, found: Boolean(data.found ?? true),
-      author: String(data.author || author.uniqueId || 'Tidak diketahui').slice(0, 100),
-      username: String(data.author || author.uniqueId || 'Tidak diketahui').slice(0, 100),
+
+    const safeAuthor = {
+      uniqueId: String(author.uniqueId || data.author || '').slice(0, 100),
       nickname: String(author.nickname || '').slice(0, 120),
-      authorDetail: { uniqueId: String(author.uniqueId || data.author || '').slice(0, 100), nickname: String(author.nickname || '').slice(0, 120), avatar: httpsMediaUrl(author.avatar), bio: String(author.bio || '').slice(0, 500) },
+      avatar: httpsMediaUrl(author.avatar),
+      bio: String(author.bio || '').slice(0, 500)
+    };
+
+    const safeAuthorName = String(
+      data.author || author.uniqueId || 'Tidak diketahui'
+    ).slice(0, 100);
+
+    // IMPORTANT: Deliberately construct a DTO. Never spread or return `data`.
+    return res.json({
+      ok: true,
+      found: Boolean(data.found ?? true),
+      author: safeAuthorName,
+      username: safeAuthorName,
+      nickname: safeAuthor.nickname,
+      authorDetail: safeAuthor,
       caption: normalizedVideo.description,
       videoUrl: normalizedVideo.url,
       sourceUrl: normalizedVideo.url,
       video: normalizedVideo,
-      videoStreamUrl,
       videoWidth: normalizedVideo.width,
       videoHeight: normalizedVideo.height,
       cover: normalizedVideo.cover,
@@ -243,8 +278,7 @@ app.post('/api/finder', async (req, res) => {
       likes: normalizedVideo.stats.likes,
       comments: normalizedVideo.stats.comments,
       shares: normalizedVideo.stats.shares,
-      presetLinks: normalizedLinks,
-      links: links.slice(0, 12)
+      presetLinks
     });
   } catch (err) {
     return res.status(502).json({ error: safeError(err) });
