@@ -72,11 +72,11 @@
     if (widgetId != null) {
       try { return window.turnstile.getResponse(widgetId) || ''; } catch { return ''; }
     }
-    // fallback: ambil dari input hidden
     const input = document.querySelector('[name="cf-turnstile-response"]');
     return input ? input.value : '';
   }
 
+  /* ── Reset Turnstile biar bisa dipakai request berikutnya ── */
   function resetTurnstile() {
     if (!window.turnstile) return;
     const widget = document.querySelector('.cf-turnstile');
