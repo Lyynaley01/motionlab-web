@@ -17,21 +17,9 @@ const FINDER_TOKEN_SECRET = process.env.FINDER_TOKEN_SECRET || crypto.randomByte
 const PAGE_TOKEN_SECRET   = process.env.PAGE_TOKEN_SECRET   || crypto.randomBytes(32).toString('hex');
 const TURNSTILE_SECRET    = process.env.TURNSTILE_SECRET_KEY || '';
 
-/* ─── DEBUG: log env saat startup ─────────────────────────────── */
-console.log('=== STARTUP DEBUG ===');
-console.log('NODE_ENV:', process.env.NODE_ENV);
-console.log('PORT:', PORT);
-console.log('ALLOWED_ORIGINS parsed:', JSON.stringify(allowedOrigins));
-console.log('TURNSTILE_SECRET present?', !!TURNSTILE_SECRET);
-console.log('PAGE_TOKEN_SECRET present?', !!process.env.PAGE_TOKEN_SECRET);
-console.log('FINDER_TOKEN_SECRET present?', !!process.env.FINDER_TOKEN_SECRET);
-console.log('AM_FINDER_URL present?', !!process.env.AM_FINDER_URL);
-console.log('=====================');
-
-/* TTL: init token hidup 15 menit, sekali pakai */
 const INIT_TOKEN_TTL_MS = 15 * 60 * 1000;
 
-/* ─── Used-token store (single-use nonce) ─────────────────────── */
+/* ─── Used-token store ─────────────────────────────────────────── */
 const usedInitTokens = new Map();
 setInterval(() => {
   const now = Date.now();
@@ -42,49 +30,118 @@ setInterval(() => {
 
 /* ─── Rate limiters ─────────────────────────────────────────────── */
 const initLimit = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 3,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000, limit: 3,
+  standardHeaders: 'draft-7', legacyHeaders: false,
   keyGenerator: (req) => `${req.ip}:${(req.headers['user-agent'] || '').slice(0, 50)}`,
   message: { error: 'Batas sesi tercapai. Coba lagi nanti.' }
 });
 
 const finderLimit = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 20,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000, limit: 20,
+  standardHeaders: 'draft-7', legacyHeaders: false,
   message: { error: 'Terlalu banyak pencarian. Coba lagi beberapa saat.' }
 });
 
 const baseLimit = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: Number(process.env.API_RATE_LIMIT || 30),
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000, limit: Number(process.env.API_RATE_LIMIT || 30),
+  standardHeaders: 'draft-7', legacyHeaders: false,
   message: { error: 'Terlalu banyak request. Coba lagi beberapa saat.' }
 });
 
+/* ═══════════════════════════════════════════════════════════════
+   AMPREM — 5-LAYER COOLDOWN SYSTEM
+   ═══════════════════════════════════════════════════════════════ */
 const AMPREM_COOLDOWN_MS = 5 * 60 * 1000;
-const ampremCooldown = new Map();
-function ampremLimit(req, res, next) {
-  const key  = req.ip;
-  const now  = Date.now();
-  const last = ampremCooldown.get(key);
+const ampremIpCooldown     = new Map(); // ip → timestamp
+const ampremEmailCooldown  = new Map(); // email → timestamp
+const ampremFpCooldown     = new Map(); // fingerprint → timestamp
+const ampremSessions       = new Map(); // sessionId → { secret, exp, ip }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of ampremSessions) {
+    if (s.exp < now) ampremSessions.delete(id);
+  }
+}, 5 * 60 * 1000);
+
+// Layer 1: Cooldown per IP
+function ampremLimitByIP(req, res, next) {
+  const now = Date.now();
+  const last = ampremIpCooldown.get(req.ip);
   if (last && now - last < AMPREM_COOLDOWN_MS) {
     const retryAfter = Math.ceil((AMPREM_COOLDOWN_MS - (now - last)) / 1000);
-    res.setHeader('Retry-After', String(retryAfter));
-    return res.status(429).json({ error: 'Amprem sedang cooldown. Coba lagi dalam 5 menit.', retryAfter });
+    return res.status(429).json({ error: 'Cooldown. Coba lagi nanti.', retryAfter });
   }
-  ampremCooldown.set(key, now);
+  ampremIpCooldown.set(req.ip, now);
+  next();
+}
+
+// Layer 2: Cooldown per Email
+function ampremLimitByEmail(req, res, next) {
+  const email = (req.body?.email || '').toLowerCase().trim();
+  if (!email) return next();
+  const now = Date.now();
+  const last = ampremEmailCooldown.get(email);
+  if (last && now - last < AMPREM_COOLDOWN_MS) {
+    const retryAfter = Math.ceil((AMPREM_COOLDOWN_MS - (now - last)) / 1000);
+    return res.status(429).json({ error: 'Email ini sedang cooldown. Coba lagi nanti.', retryAfter });
+  }
+  ampremEmailCooldown.set(email, now);
+  next();
+}
+
+// Layer 3: Cooldown per Fingerprint (anti-proxy rotasi)
+function ampremLimitByFingerprint(req, res, next) {
+  const fp = req.headers['x-fp'] || '';
+  if (!fp || typeof fp !== 'string' || fp.length < 32) {
+    return res.status(400).json({ error: 'Fingerprint tidak valid.' });
+  }
+  const now = Date.now();
+  const last = ampremFpCooldown.get(fp);
+  if (last && now - last < AMPREM_COOLDOWN_MS) {
+    const retryAfter = Math.ceil((AMPREM_COOLDOWN_MS - (now - last)) / 1000);
+    return res.status(429).json({ error: 'Perangkat ini sedang cooldown. Coba lagi nanti.', retryAfter });
+  }
+  ampremFpCooldown.set(fp, now);
+  next();
+}
+
+// Layer 4: HMAC signature (anti-curl/Postman)
+function requireAmpSignedRequest(req, res, next) {
+  const sessionId = req.headers['x-session-id'];
+  const signature = req.headers['x-signature'];
+  const timestamp = Number(req.headers['x-timestamp']);
+
+  if (!sessionId || !signature || !timestamp) {
+    return res.status(403).json({ error: 'Akses ditolak.' });
+  }
+  if (Math.abs(Date.now() - timestamp) > 60_000) {
+    return res.status(403).json({ error: 'Request terlalu lama.' });
+  }
+  const session = ampremSessions.get(sessionId);
+  if (!session || session.exp < Date.now()) {
+    return res.status(403).json({ error: 'Sesi tidak valid.' });
+  }
+  if (session.ip !== req.ip) {
+    return res.status(403).json({ error: 'Sesi tidak valid.' });
+  }
+  const payload = `${req.method}|${req.path}|${timestamp}|${JSON.stringify(req.body)}`;
+  const expected = crypto.createHmac('sha256', session.secret).update(payload).digest('hex');
+  try {
+    const sigBuf = Buffer.from(signature, 'hex');
+    const expBuf = Buffer.from(expected, 'hex');
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return res.status(403).json({ error: 'Signature tidak valid.' });
+    }
+  } catch {
+    return res.status(403).json({ error: 'Signature tidak valid.' });
+  }
+  ampremSessions.delete(sessionId); // single-use
   next();
 }
 
 /* ─── Crypto helpers: Finder payload ───────────────────────────── */
-function finderTokenKey() {
-  return crypto.createHash('sha256').update(FINDER_TOKEN_SECRET).digest();
-}
+function finderTokenKey() { return crypto.createHash('sha256').update(FINDER_TOKEN_SECRET).digest(); }
 function sealFinderPayload(payload) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', finderTokenKey(), iv);
@@ -97,19 +154,15 @@ function openFinderPayload(token) {
   try {
     const raw = Buffer.from(token, 'base64url');
     if (raw.length < 29) return null;
-    const iv  = raw.subarray(0, 12);
-    const tag = raw.subarray(12, 28);
-    const enc = raw.subarray(28);
-    const d   = crypto.createDecipheriv('aes-256-gcm', finderTokenKey(), iv);
+    const iv  = raw.subarray(0, 12), tag = raw.subarray(12, 28), enc = raw.subarray(28);
+    const d = crypto.createDecipheriv('aes-256-gcm', finderTokenKey(), iv);
     d.setAuthTag(tag);
     return JSON.parse(Buffer.concat([d.update(enc), d.final()]).toString('utf8'));
   } catch { return null; }
 }
 
-/* ─── Crypto helpers: Init/page token ──────────────────────────── */
-function pageTokenKey() {
-  return crypto.createHash('sha256').update(PAGE_TOKEN_SECRET).digest();
-}
+/* ─── Crypto helpers: Page token ───────────────────────────────── */
+function pageTokenKey() { return crypto.createHash('sha256').update(PAGE_TOKEN_SECRET).digest(); }
 function sealPageToken(payload) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', pageTokenKey(), iv);
@@ -122,103 +175,66 @@ function openPageToken(token) {
   try {
     const raw = Buffer.from(token, 'base64url');
     if (raw.length < 29) return null;
-    const iv  = raw.subarray(0, 12);
-    const tag = raw.subarray(12, 28);
-    const enc = raw.subarray(28);
-    const d   = crypto.createDecipheriv('aes-256-gcm', pageTokenKey(), iv);
+    const iv  = raw.subarray(0, 12), tag = raw.subarray(12, 28), enc = raw.subarray(28);
+    const d = crypto.createDecipheriv('aes-256-gcm', pageTokenKey(), iv);
     d.setAuthTag(tag);
     return JSON.parse(Buffer.concat([d.update(enc), d.final()]).toString('utf8'));
   } catch { return null; }
 }
 
-/* ─── Middleware: blokir curl/wget/python/UA kosong ───────────── */
+/* ─── Middleware: blockNonBrowser ──────────────────────────────── */
 function blockNonBrowser(req, res, next) {
   const ua = req.headers['user-agent'] || '';
-  const al = req.headers['accept-language'] || '';
-  console.log('=== [1] blockNonBrowser ===', {
-    path: req.path,
-    hasUA: !!ua,
-    hasAL: !!al,
-    ua: ua.slice(0, 80)
-  });
-  if (!ua || /curl|wget|python|axios|node-fetch|httpclient|okhttp|go-http/i.test(ua)) {
-    console.log('=== [1] BLOCKED: UA curl/bot ===');
+  if (!ua || /curl|wget|python|axios|node-fetch|httpclient|okhttp|go-http|postman/i.test(ua)) {
     return res.status(403).json({ error: 'Akses ditolak.' });
   }
-  if (!al) {
-    console.log('=== [1] BLOCKED: no Accept-Language ===');
+  if (!req.headers['accept-language']) {
     return res.status(403).json({ error: 'Akses ditolak.' });
   }
   next();
 }
 
-/* ─── Middleware: validasi page token + single-use + IP check ──── */
+/* ─── Middleware: requirePageToken ─────────────────────────────── */
 function requirePageToken(req, res, next) {
-  const raw     = typeof req.headers['x-pt'] === 'string' ? req.headers['x-pt'] : '';
+  const raw = typeof req.headers['x-pt'] === 'string' ? req.headers['x-pt'] : '';
   const payload = openPageToken(raw);
-  console.log('=== [2] requirePageToken ===', {
-    path: req.path,
-    hasToken: !!raw,
-    tokenLen: raw.length,
-    decoded: payload ? { jti: payload.jti?.slice(0, 8), exp: payload.exp } : null
-  });
   if (!payload || payload.exp < Date.now()) {
-    console.log('=== [2] BLOCKED: token invalid/expired ===');
     return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
   }
   if (!payload.jti || usedInitTokens.has(payload.jti)) {
-    console.log('=== [2] BLOCKED: token already used ===');
     return res.status(403).json({ error: 'Token sudah digunakan. Muat ulang halaman.' });
   }
   if (payload.ip && payload.ip !== req.ip) {
-    console.log('=== [2] BLOCKED: IP mismatch ===');
     return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
   }
   usedInitTokens.set(payload.jti, payload.exp);
-  console.log('=== [2] PASS ===');
   next();
 }
 
-/* ─── Middleware: Cloudflare Turnstile ────────────────────────── */
+/* ─── Middleware: requireTurnstile ─────────────────────────────── */
 async function requireTurnstile(req, res, next) {
-  console.log('=== [3] requireTurnstile ===', {
-    path: req.path,
-    hasSecret: !!TURNSTILE_SECRET,
-    hasXs: !!req.headers['x-ts'],
-    xsLen: (req.headers['x-ts'] || '').length
-  });
   if (!TURNSTILE_SECRET) {
-    console.log('=== [3] BLOCKED: TURNSTILE_SECRET not set ===');
     return res.status(503).json({ error: 'Verifikasi belum dikonfigurasi.' });
   }
   const cfToken = typeof req.headers['x-ts'] === 'string' ? req.headers['x-ts'] : '';
-  if (!cfToken) {
-    console.log('=== [3] BLOCKED: no X-Ts header ===');
-    return res.status(403).json({ error: 'Verifikasi diperlukan.' });
-  }
+  if (!cfToken) return res.status(403).json({ error: 'Verifikasi diperlukan.' });
   try {
     const form = new URLSearchParams();
-    form.append('secret',   TURNSTILE_SECRET);
+    form.append('secret', TURNSTILE_SECRET);
     form.append('response', cfToken);
     form.append('remoteip', req.ip || '');
     const r = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify',
       form.toString(),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 5000 }
     );
-    console.log('=== [3] Turnstile response ===', JSON.stringify(r.data));
-    if (!r.data?.success) {
-      console.log('=== [3] BLOCKED: Turnstile success=false ===', r.data?.['error-codes']);
-      return res.status(403).json({ error: 'Verifikasi gagal. Coba lagi.' });
-    }
-    console.log('=== [3] PASS ===');
+    if (!r.data?.success) return res.status(403).json({ error: 'Verifikasi gagal. Coba lagi.' });
     next();
-  } catch (err) {
-    console.log('=== [3] BLOCKED: Turnstile request error ===', err.message);
+  } catch {
     return res.status(503).json({ error: 'Layanan verifikasi tidak tersedia.' });
   }
 }
 
-/* ─── Express setup ─────────────────────────────────────────────── */
+/* ─── Express setup ────────────────────────────────────────────── */
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet({
@@ -241,53 +257,28 @@ app.use(helmet({
 app.use(compression());
 app.use(express.json({ limit: '12kb', strict: true }));
 
-/* ═══════════════════════════════════════════════════════════════
-   ORIGIN GUARD (FIXED)
-   ───────────────────────────────────────────────────────────────
-   - Kalau Origin/Referer KOSONG → izinkan (same-origin request)
-   - Kalau ada Origin/Referer → WAJIB cocok dengan ALLOWED_ORIGINS
-   ═══════════════════════════════════════════════════════════════ */
+/* ─── Origin guard ─────────────────────────────────────────────── */
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', req.path.startsWith('/api/') ? 'no-store' : 'public, max-age=300');
 
-  if (req.path.startsWith('/api/_')) {
+  if (req.path.startsWith('/api/_') || req.path.startsWith('/api/amprem')) {
     const origin  = req.get('origin')  || '';
     const referer = req.get('referer') || '';
     const check   = origin || referer;
 
-    console.log('=== [0] ORIGIN GUARD ===', JSON.stringify({
-      path: req.path,
-      method: req.method,
-      origin: origin,
-      referer: referer,
-      check: check,
-      allowedOrigins: allowedOrigins,
-      allowedCount: allowedOrigins.length
-    }));
-
     if (!allowedOrigins.length) {
-      console.log('=== [0] BLOCKED: no ALLOWED_ORIGINS set ===');
       return res.status(503).json({ error: 'Konfigurasi origin belum siap.' });
     }
+    if (!check) return next(); // same-origin, izinkan
 
-    /* ── FIX: kalau Origin/Referer KOSONG, izinkan (same-origin request) ── */
-    if (!check) {
-      console.log('=== [0] PASS: no origin header (same-origin) ===');
-      return next();
-    }
-
-    /* ── Kalau ada Origin/Referer, WAJIB cocok ── */
-    const match = allowedOrigins.some(o => check.startsWith(o));
-    if (!match) {
-      console.log('=== [0] BLOCKED: origin mismatch ===', JSON.stringify({ check, allowedOrigins }));
+    if (!allowedOrigins.some(o => check.startsWith(o))) {
       return res.status(403).json({ error: 'Akses ditolak.' });
     }
-    console.log('=== [0] PASS ===');
   }
   next();
 });
 
-/* ─── Rate limit router ─────────────────────────────────────────── */
+/* ─── Rate limit router ────────────────────────────────────────── */
 app.use('/api', (req, res, next) => {
   if (req.path === '/_/init') return next();
   if (req.path === '/_/s')    return next();
@@ -297,7 +288,7 @@ app.use('/api', (req, res, next) => {
 
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'], index: 'index.html' }));
 
-/* ─── Helpers ───────────────────────────────────────────────────── */
+/* ─── Helpers ──────────────────────────────────────────────────── */
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 function safeError(err) {
   const status = err.response?.status;
@@ -345,66 +336,26 @@ function resolveVideoMediaUrl(video = {}, data = {}) {
   return walk(video) || walk(data.video) || null;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
    ROUTES
-═══════════════════════════════════════════════════════════════════ */
+   ═══════════════════════════════════════════════════════════════ */
 
 app.get('/api/health', (_req, res) =>
   res.json({ ok: true, service: 'Alight Motion Hub', status: 'online' })
 );
 
-/* ── Init: issue single-use page token ────────────────────────── */
+/* ── Init: page token ──────────────────────────────────────────── */
 app.get('/api/_/init', initLimit, blockNonBrowser, requireTurnstile, (req, res) => {
-  console.log('=== [4] /api/_/init SUCCESS — issuing token ===');
   const jti = crypto.randomBytes(16).toString('hex');
   const token = sealPageToken({
-    jti,
-    ip:  req.ip || '',
-    ua:  (req.headers['user-agent'] || '').slice(0, 200),
-    iat: Date.now(),
-    exp: Date.now() + INIT_TOKEN_TTL_MS
+    jti, ip: req.ip || '',
+    ua: (req.headers['user-agent'] || '').slice(0, 200),
+    iat: Date.now(), exp: Date.now() + INIT_TOKEN_TTL_MS
   });
   return res.json({ pt: token });
 });
 
-/* ── Amprem V2 ──────────────────────────────────────────────────── */
-app.post('/api/amprem/send-link', ampremLimit, async (req, res) => {
-  const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
-  if (!req.body?.consent) return res.status(400).json({ error: 'Konfirmasi kepemilikan email diperlukan.' });
-  if (email.length > 254 || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Format email tidak valid.' });
-  try {
-    const upstream = await axios.post(process.env.AMPREM_SEND_URL, { email }, {
-      timeout: 15000, maxRedirects: 0,
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'AlightMotionHub/1.0' }
-    });
-    if (!upstream.data?.success) return res.status(422).json({ error: 'Link verifikasi belum dapat dikirim. Periksa email atau coba nanti.' });
-    return res.json({ ok: true, message: 'Jika email dapat diproses, link verifikasi akan dikirim. Periksa inbox dan folder spam.' });
-  } catch (err) { return res.status(502).json({ error: safeError(err) }); }
-});
-
-app.post('/api/amprem/verify-link', ampremLimit, async (req, res) => {
-  const email     = typeof req.body?.email === 'string'     ? req.body.email.trim()     : '';
-  const magicLink = typeof req.body?.magicLink === 'string' ? req.body.magicLink.trim() : '';
-  if (!req.body?.consent) return res.status(400).json({ error: 'Konfirmasi kepemilikan diperlukan.' });
-  if (email.length > 254 || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Format email tidak valid.' });
-  if (!/^https:\/\//i.test(magicLink) || magicLink.length > 4096)
-    return res.status(400).json({ error: 'Magic link harus berupa URL HTTPS yang valid.' });
-  try {
-    const upstream = await axios.post(process.env.AMPREM_VERIFY_URL, { email, magicLink }, {
-      timeout: 15000, maxRedirects: 0,
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'AlightMotionHub/1.0' }
-    });
-    if (!upstream.data?.success) return res.status(422).json({ error: 'Verifikasi gagal. Pastikan link masih berlaku.' });
-    const d = upstream.data;
-    return res.json({ ok: true, message: String(d.message || 'Verifikasi selesai.'),
-      uid: d.uid == null ? null : String(d.uid),
-      planName: d.planName == null ? null : String(d.planName),
-      validUntil: d.validUntil == null ? null : String(d.validUntil)
-    });
-  } catch (err) { return res.status(502).json({ error: safeError(err) }); }
-});
-
-/* ── AM Finder: step 1 ──────────────────────────────────────────── */
+/* ── AM Finder: step 1 ─────────────────────────────────────────── */
 app.post('/api/_/s', finderLimit, blockNonBrowser, requirePageToken, async (req, res) => {
   const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'Masukkan URL video TikTok HTTPS yang valid.' });
@@ -418,7 +369,7 @@ app.post('/api/_/s', finderLimit, blockNonBrowser, requirePageToken, async (req,
     });
 
     const raw = String(upstream.data || '').trim();
-    let data  = null;
+    let data = null;
     try { data = JSON.parse(raw); } catch {
       const lines = raw.split(/\r?\n/); let event = '';
       for (const line of lines) {
@@ -454,15 +405,14 @@ app.post('/api/_/s', finderLimit, blockNonBrowser, requirePageToken, async (req,
         } catch {}
       }
     }
-    if (!presetLinks.length)
-      return res.status(404).json({ error: 'Preset tidak ditemukan pada video ini.' });
+    if (!presetLinks.length) return res.status(404).json({ error: 'Preset tidak ditemukan pada video ini.' });
 
     const videoUrlCandidate = video.url || data.videoUrl || url;
     const videoUrl = validHttpsUrl(videoUrlCandidate) ? videoUrlCandidate : url;
 
     const normalizedVideo = {
-      id:          video.id == null ? null : String(video.id).slice(0, 80),
-      url:         videoUrl,
+      id: video.id == null ? null : String(video.id).slice(0, 80),
+      url: videoUrl,
       description: String(video.description || video.desc || data.caption || '').slice(0, 1200),
       stats: {
         views:    video.stats?.views    == null ? null : Number(video.stats.views),
@@ -470,7 +420,7 @@ app.post('/api/_/s', finderLimit, blockNonBrowser, requirePageToken, async (req,
         comments: video.stats?.comments == null ? null : Number(video.stats.comments),
         shares:   video.stats?.shares   == null ? null : Number(video.stats.shares)
       },
-      cover:  httpsMediaUrl(video.cover || video.coverUrl || video.thumbnail),
+      cover: httpsMediaUrl(video.cover || video.coverUrl || video.thumbnail),
       width:  Number.isFinite(Number(video.width))  ? Number(video.width)  : null,
       height: Number.isFinite(Number(video.height)) ? Number(video.height) : null
     };
@@ -502,16 +452,16 @@ app.post('/api/_/s', finderLimit, blockNonBrowser, requirePageToken, async (req,
   } catch (err) { return res.status(502).json({ error: safeError(err) }); }
 });
 
-/* ── AM Finder: step 2 ──────────────────────────────────────────── */
+/* ── AM Finder: step 2 ─────────────────────────────────────────── */
 app.post('/api/_/r', (req, res) => {
-  const token  = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
   const sealed = openFinderPayload(token);
   if (!sealed || !sealed.dto || sealed.exp < Date.now())
     return res.status(410).json({ error: 'Hasil Finder sudah kedaluwarsa. Silakan cari ulang.' });
   return res.json(sealed.dto);
 });
 
-/* ── Video proxy ─────────────────────────────────────────────── */
+/* ── Video proxy ───────────────────────────────────────────────── */
 app.get('/api/_/v', async (req, res) => {
   const url = typeof req.query?.url === 'string' ? req.query.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'URL video TikTok tidak valid.' });
@@ -541,8 +491,8 @@ app.get('/api/_/v', async (req, res) => {
       responseType: 'stream', timeout: 30000, maxRedirects: 2,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36',
-        'Accept':    'video/mp4,video/*;q=0.9,*/*;q=0.8',
-        'Referer':   'https://www.tiktok.com/',
+        'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+        'Referer': 'https://www.tiktok.com/',
         ...(range ? { Range: range } : {})
       },
       validateStatus: s => (s >= 200 && s < 300) || s === 206
@@ -560,7 +510,78 @@ app.get('/api/_/v', async (req, res) => {
   } catch (err) { return res.status(502).json({ error: safeError(err) }); }
 });
 
-/* ── Fallback ────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   AMPREM V2 — PROTECTED ENDPOINTS
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Session endpoint: kasih HMAC secret ── */
+app.get('/api/amprem/session', blockNonBrowser, requireTurnstile, (req, res) => {
+  const sessionId = crypto.randomBytes(16).toString('hex');
+  const sessionSecret = crypto.randomBytes(32).toString('hex');
+  ampremSessions.set(sessionId, {
+    secret: sessionSecret,
+    exp: Date.now() + 10 * 60 * 1000,
+    ip: req.ip,
+  });
+  return res.json({ sessionId, sessionSecret, exp: Date.now() + 10 * 60 * 1000 });
+});
+
+/* ── Send link ── */
+app.post('/api/amprem/send-link',
+  blockNonBrowser,
+  requireTurnstile,
+  requireAmpSignedRequest,
+  ampremLimitByIP,
+  ampremLimitByEmail,
+  ampremLimitByFingerprint,
+  async (req, res) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+    if (!req.body?.consent) return res.status(400).json({ error: 'Konfirmasi kepemilikan email diperlukan.' });
+    if (email.length > 254 || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Format email tidak valid.' });
+    try {
+      const upstream = await axios.post(process.env.AMPREM_SEND_URL, { email }, {
+        timeout: 15000, maxRedirects: 0,
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'AlightMotionHub/1.0' }
+      });
+      if (!upstream.data?.success) return res.status(422).json({ error: 'Link verifikasi belum dapat dikirim. Periksa email atau coba nanti.' });
+      return res.json({ ok: true, message: 'Jika email dapat diproses, link verifikasi akan dikirim. Periksa inbox dan folder spam.' });
+    } catch (err) { return res.status(502).json({ error: safeError(err) }); }
+  }
+);
+
+/* ── Verify link ── */
+app.post('/api/amprem/verify-link',
+  blockNonBrowser,
+  requireTurnstile,
+  requireAmpSignedRequest,
+  ampremLimitByIP,
+  ampremLimitByEmail,
+  ampremLimitByFingerprint,
+  async (req, res) => {
+    const email     = typeof req.body?.email === 'string'     ? req.body.email.trim()     : '';
+    const magicLink = typeof req.body?.magicLink === 'string' ? req.body.magicLink.trim() : '';
+    if (!req.body?.consent) return res.status(400).json({ error: 'Konfirmasi kepemilikan diperlukan.' });
+    if (email.length > 254 || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Format email tidak valid.' });
+    if (!/^https:\/\//i.test(magicLink) || magicLink.length > 4096)
+      return res.status(400).json({ error: 'Magic link harus berupa URL HTTPS yang valid.' });
+    try {
+      const upstream = await axios.post(process.env.AMPREM_VERIFY_URL, { email, magicLink }, {
+        timeout: 15000, maxRedirects: 0,
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'AlightMotionHub/1.0' }
+      });
+      if (!upstream.data?.success) return res.status(422).json({ error: 'Verifikasi gagal. Pastikan link masih berlaku.' });
+      const d = upstream.data;
+      return res.json({
+        ok: true, message: String(d.message || 'Verifikasi selesai.'),
+        uid: d.uid == null ? null : String(d.uid),
+        planName: d.planName == null ? null : String(d.planName),
+        validUntil: d.validUntil == null ? null : String(d.validUntil)
+      });
+    } catch (err) { return res.status(502).json({ error: safeError(err) }); }
+  }
+);
+
+/* ── Fallback ─────────────────────────────────────────────────── */
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Endpoint tidak ditemukan.' });
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
