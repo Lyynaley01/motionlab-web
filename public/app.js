@@ -63,10 +63,20 @@
     toast.timer = setTimeout(() => el.classList.remove('show'), 2800);
   }
 
+  let _pt = '';
+
+  (async () => {
+    try {
+      const r = await fetch('/api/_/init');
+      const d = await r.json();
+      _pt = d.pt || '';
+    } catch { _pt = ''; }
+  })();
+
   async function api(path, body) {
     const res = await fetch(path, {
       method:'POST',
-      headers:{'Content-Type':'application/json','Accept':'application/json'},
+      headers:{'Content-Type':'application/json','Accept':'application/json','X-Pt':_pt},
       body: JSON.stringify(body),
       credentials:'same-origin'
     });
@@ -126,9 +136,9 @@
     finderSubmit.disabled = true;
 
     try {
-      const finderStatus = await api('/api/finder', { url: $('#tiktokUrl').value.trim() });
+      const finderStatus = await api('/api/_/s', { url: $('#tiktokUrl').value.trim() });
       if (!finderStatus.token) throw new Error('Hasil Finder tidak tersedia. Coba lagi.');
-      const data = await api('/api/finder/result', { token: finderStatus.token });
+      const data = await api('/api/_/r', { token: finderStatus.token });
 
       if (!data.ok && !data.found && !data.presetLinks && !data.links) {
         throw new Error('Preset tidak ditemukan untuk video ini.');
@@ -159,7 +169,7 @@
         player.playsInline = true;
         player.preload = 'metadata';
         player.setAttribute('controlsList', 'nodownload');
-        player.src = `/api/finder/video?url=${encodeURIComponent(sourceUrl)}`;
+        player.src = `/api/_/v?url=${encodeURIComponent(sourceUrl)}`;
         if (coverUrl) player.poster = coverUrl;
         if (videoWidth > 0 && videoHeight > 0) player.style.aspectRatio = `${videoWidth} / ${videoHeight}`;
         player.setAttribute('aria-label', 'Pratinjau video TikTok — ketuk video untuk membuka dengan audio');
@@ -187,7 +197,7 @@
             document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal.classList.contains('show')) close(); });
           }
           const modalPlayer = modal.querySelector('video');
-          modalPlayer.src = `/api/finder/video?url=${encodeURIComponent(sourceUrl)}`;
+          modalPlayer.src = `/api/_/v?url=${encodeURIComponent(sourceUrl)}`;
           modalPlayer.poster = coverUrl || '';
           modalPlayer.muted = false;
           if (videoWidth > 0 && videoHeight > 0) modalPlayer.style.aspectRatio = `${videoWidth} / ${videoHeight}`;
