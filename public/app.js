@@ -63,38 +63,42 @@
     toast.timer = setTimeout(() => el.classList.remove('show'), 2800);
   }
 
-  /* ── Ambil token Turnstile dari widget ── */
-  function getTurnstileToken() {
+  /* ── Turnstile helpers (multi-widget aware) ── */
+  function getTurnstileToken(formSelector) {
     if (!window.turnstile) return '';
-    const widget = document.querySelector('.cf-turnstile');
-    if (!widget) return '';
-    const widgetId = widget.getAttribute('data-widget-id');
+    const container = formSelector
+      ? document.querySelector(`${formSelector} .cf-turnstile`)
+      : document.querySelector('.cf-turnstile');
+    if (!container) return '';
+    const widgetId = container.getAttribute('data-widget-id');
     if (widgetId != null) {
       try { return window.turnstile.getResponse(widgetId) || ''; } catch { return ''; }
     }
-    const input = document.querySelector('[name="cf-turnstile-response"]');
+    const input = container.querySelector('[name="cf-turnstile-response"]');
     return input ? input.value : '';
   }
 
-  /* ── Reset Turnstile biar bisa dipakai request berikutnya ── */
-  function resetTurnstile() {
+  function resetTurnstile(formSelector) {
     if (!window.turnstile) return;
-    const widget = document.querySelector('.cf-turnstile');
-    if (!widget) return;
-    const widgetId = widget.getAttribute('data-widget-id');
+    const container = formSelector
+      ? document.querySelector(`${formSelector} .cf-turnstile`)
+      : document.querySelector('.cf-turnstile');
+    if (!container) return;
+    const widgetId = container.getAttribute('data-widget-id');
     if (widgetId != null) {
       try { window.turnstile.reset(widgetId); } catch {}
     }
   }
 
-  /* ── Page token: single-use, di-fetch fresh setiap kali submit ── */
+  /* ── Finder: getFreshToken ── */
   async function getFreshToken() {
-    const tsToken = getTurnstileToken();
+    const tsToken = getTurnstileToken('#finderForm');
     if (!tsToken) {
       throw new Error('Selesaikan verifikasi keamanan dulu (centang Turnstile).');
     }
-    const headers = { 'Accept': 'application/json', 'X-Ts': tsToken };
-    const r = await fetch('/api/_/init', { headers });
+    const r = await fetch('/api/_/init', {
+      headers: { 'Accept': 'application/json', 'X-Ts': tsToken }
+    });
     if (!r.ok) {
       let msg = 'Gagal mendapatkan sesi. Muat ulang halaman.';
       try { const e = await r.json(); if (e?.error) msg = e.error; } catch {}
@@ -129,6 +133,74 @@
     let data;
     try { data = await res.json(); } catch { data = {}; }
     if (!res.ok) throw new Error(data.error || 'Permintaan gagal. Coba lagi.');
+    return data;
+  }
+
+  /* ═══════════════════════════════════════════
+     AMPREM V2 — Fingerprint + HMAC
+     ═══════════════════════════════════════════ */
+
+  async function getDeviceFingerprint() {
+    const data = [
+      navigator.userAgent,
+      navigator.language,
+      screen.width + 'x' + screen.height,
+      screen.colorDepth,
+      new Date().getTimezoneOffset(),
+      navigator.hardwareConcurrency || 0,
+      navigator.platform,
+    ].join('|');
+    const buf = new TextEncoder().encode(data);
+    const hash = await crypto.subtle.digest('SHA-256', buf);
+    return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function signRequest(sessionSecret, method, path, body) {
+    const timestamp = Date.now();
+    const payload = `${method}|${path}|${timestamp}|${JSON.stringify(body)}`;
+    const key = await crypto.subtle.importKey(
+      'raw', new TextEncoder().encode(sessionSecret),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+    const signature = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    return { signature, timestamp };
+  }
+
+  async function ampremRequest(path, body, turnstileForm) {
+    const tsToken = getTurnstileToken(turnstileForm);
+    if (!tsToken) throw new Error('Selesaikan verifikasi Turnstile dulu.');
+
+    const sessionRes = await fetch('/api/amprem/session', {
+      headers: { 'X-Ts': tsToken, 'Accept': 'application/json' }
+    });
+    if (!sessionRes.ok) {
+      let msg = 'Gagal membuat sesi aman.';
+      try { const e = await sessionRes.json(); if (e?.error) msg = e.error; } catch {}
+      throw new Error(msg);
+    }
+    const { sessionId, sessionSecret } = await sessionRes.json();
+
+    const fp = await getDeviceFingerprint();
+    const { signature, timestamp } = await signRequest(sessionSecret, 'POST', path, body);
+
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Ts': tsToken,
+        'X-Session-Id': sessionId,
+        'X-Signature': signature,
+        'X-Timestamp': String(timestamp),
+        'X-FP': fp,
+      },
+      body: JSON.stringify(body),
+      credentials: 'same-origin',
+    });
+    let data;
+    try { data = await res.json(); } catch { data = {}; }
+    if (!res.ok) throw new Error(data.error || 'Permintaan gagal.');
     return data;
   }
 
@@ -521,8 +593,7 @@
     } finally {
       finderLoading.classList.remove('show');
       finderSubmit.disabled = false;
-      /* reset Turnstile biar bisa dipakai request berikutnya */
-      resetTurnstile();
+      resetTurnstile('#finderForm');
     }
   });
 
@@ -568,7 +639,7 @@
     ampremLoading.classList.add('show');
     $('#ampremLoadingTitle').textContent = 'Sending verification link…';
     try {
-      const d = await api('/api/amprem/send-link', { email: emailValue, consent: true });
+      const d = await ampremRequest('/api/amprem/send-link', { email: emailValue, consent: true }, '#emailForm');
       emailForm.classList.add('hidden');
       magicForm.classList.remove('hidden');
       $('#ampremStepTitle').textContent = 'Paste your magic link';
@@ -587,6 +658,7 @@
     } finally {
       btn.disabled = false;
       ampremLoading.classList.remove('show');
+      resetTurnstile('#emailForm');
     }
   });
 
@@ -615,7 +687,7 @@
     ampremLoading.classList.add('show');
     $('#ampremLoadingTitle').textContent = 'Verifying with provider…';
     try {
-      const d = await api('/api/amprem/verify-link', { email: emailValue, magicLink, consent: true });
+      const d = await ampremRequest('/api/amprem/verify-link', { email: emailValue, magicLink, consent: true }, '#magicForm');
       setStep(3);
       $('#ampremStepTitle').textContent = 'Verification result';
       magicForm.classList.add('hidden');
@@ -658,6 +730,7 @@
     } finally {
       btn.disabled = false;
       ampremLoading.classList.remove('show');
+      resetTurnstile('#magicForm');
     }
   });
 })();
