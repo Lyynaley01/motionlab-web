@@ -19,9 +19,7 @@
     $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${page}`));
     $$('.nav-link').forEach(b => b.classList.toggle('active', b.dataset.page === page));
     $('#crumbName').textContent = names[page];
-    $('#sidebar').classList.remove('open');
-    const ov2 = document.getElementById('sidebar-overlay');
-    if (ov2) ov2.classList.remove('show');
+    closeSidebar();
     replayEntrance(activePage);
     window.scrollTo({top:0,behavior:'smooth'});
   }
@@ -33,20 +31,29 @@
 
   const overlay = document.getElementById('sidebar-overlay');
   function closeSidebar() {
-    $('#sidebar').classList.remove('open');
-    const ov2 = document.getElementById('sidebar-overlay');
-    if (ov2) ov2.classList.remove('show');
+    const sidebar = $('#sidebar');
+    if (!sidebar) return;
+    sidebar.classList.remove('open');
     if (overlay) overlay.classList.remove('show');
+    document.body.classList.remove('sidebar-open');
+    $('#mobileMenu')?.setAttribute('aria-expanded', 'false');
   }
   function openSidebar() {
-    $('#sidebar').classList.add('open');
+    const sidebar = $('#sidebar');
+    if (!sidebar) return;
+    sidebar.classList.add('open');
     if (overlay) overlay.classList.add('show');
+    document.body.classList.add('sidebar-open');
+    $('#mobileMenu')?.setAttribute('aria-expanded', 'true');
   }
   $('#mobileMenu').addEventListener('click', () => {
     if ($('#sidebar').classList.contains('open')) closeSidebar();
     else openSidebar();
   });
   if (overlay) overlay.addEventListener('click', closeSidebar);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && $('#sidebar')?.classList.contains('open')) closeSidebar();
+  });
 
   function toast(message) {
     const el = $('#toast');

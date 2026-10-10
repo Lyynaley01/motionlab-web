@@ -2605,3 +2605,220 @@ body::after {
   .page.page-enter > *, .motionlab-pop, .motionlab-stagger > * { animation: none !important; }
   .finder-preset-card:hover, .explore-tile:hover, .tool-card:hover { transform: none; }
 }
+
+/* ═══════════════════════════════════════════
+   MOTIONLAB COMIC OVERRIDE — STRONGER COMIC IDENTITY
+   ═══════════════════════════════════════════ */
+:root {
+  --comic-red: #ff3158;
+  --comic-blue: #257cff;
+  --comic-ink: #070912;
+}
+
+/* unmistakable comic-book print texture */
+body::before {
+  opacity: .17;
+  background-image:
+    radial-gradient(circle, rgba(255,255,255,.32) 1px, transparent 1.4px),
+    linear-gradient(125deg, transparent 0 46%, rgba(255,49,88,.08) 47% 48%, transparent 49% 100%);
+  background-size: 7px 7px, 100% 100%;
+  mask-image: linear-gradient(135deg, transparent 4%, #000 25%, #000 78%, transparent 98%);
+}
+
+/* comic panel framing */
+.hero-copy,
+.hero-art,
+.tool-card,
+.explore-tile,
+.workspace-card,
+.notice,
+.result-panel,
+.security-grid > article {
+  border-radius: 14px;
+}
+
+.hero-copy {
+  position: relative;
+}
+
+.hero-copy::before {
+  content: '';
+  position: absolute;
+  left: -18px;
+  top: -14px;
+  width: 82px;
+  height: 82px;
+  border: 2px solid rgba(255,49,88,.3);
+  border-radius: 50%;
+  background: repeating-conic-gradient(from 8deg, rgba(255,49,88,.16) 0 5deg, transparent 5deg 12deg);
+  clip-path: polygon(50% 0,58% 17%,75% 7%,78% 25%,98% 24%,87% 42%,100% 55%,81% 63%,91% 82%,69% 77%,59% 100%,47% 81%,29% 94%,28% 72%,5% 73%,18% 54%,0 40%,21% 34%,11% 14%,34% 20%);
+  transform: rotate(-9deg);
+  pointer-events: none;
+}
+
+.comic-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 13px;
+  padding: 5px 9px;
+  color: #fff;
+  background: var(--comic-red);
+  border: 2px solid #080b14;
+  box-shadow: 4px 4px 0 #080b14;
+  transform: rotate(-1.5deg) skewX(-5deg);
+  font: 800 9px var(--display);
+  letter-spacing: 1.1px;
+}
+.comic-kicker span { opacity: .72; }
+
+.hero h1 {
+  text-shadow: 4px 4px 0 rgba(37,124,255,.12);
+}
+
+.hero-art {
+  position: relative;
+  overflow: visible;
+}
+
+.comic-burst {
+  position: absolute;
+  z-index: 6;
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  color: #fff;
+  font: 900 15px var(--display);
+  letter-spacing: -.5px;
+  text-shadow: 2px 2px 0 #070912;
+  background: var(--comic-red);
+  border: 3px solid #070912;
+  clip-path: polygon(50% 0,60% 17%,76% 5%,78% 23%,100% 19%,87% 39%,100% 51%,84% 61%,95% 82%,73% 76%,62% 100%,48% 82%,29% 96%,27% 74%,5% 78%,17% 58%,0 47%,18% 37%,7% 17%,32% 23%,38% 2%);
+  transform: rotate(10deg);
+  filter: drop-shadow(5px 6px 0 #070912);
+  animation: comicWiggle 3.8s ease-in-out infinite;
+}
+.comic-burst-pow { top: -26px; right: -16px; }
+.comic-burst-am { left: -22px; bottom: 24px; width: 58px; height: 58px; background: var(--comic-blue); font-size: 12px; transform: rotate(-12deg); animation-delay: -.9s; }
+
+.comic-caption {
+  position: absolute;
+  right: 8px;
+  bottom: -15px;
+  z-index: 7;
+  padding: 6px 11px;
+  color: #080b14;
+  background: #fff;
+  border: 2px solid #080b14;
+  box-shadow: 4px 4px 0 #080b14;
+  transform: rotate(-2deg);
+  font: 800 9px var(--display);
+  letter-spacing: 1.2px;
+}
+.comic-caption b { color: var(--comic-red); }
+
+.comic-side-badge {
+  position: absolute;
+  right: 4px;
+  top: 2px;
+  padding: 3px 5px;
+  color: #fff;
+  background: var(--comic-red);
+  border: 1px solid #080b14;
+  transform: rotate(8deg);
+  font: 900 7px var(--display);
+}
+
+.tool-card,
+.explore-tile,
+.workspace-card,
+.notice,
+.result-panel,
+.security-grid > article {
+  border-width: 1px 2px 2px 1px;
+}
+
+.tool-card::after,
+.explore-tile::after,
+.workspace-card::after,
+.result-panel::after {
+  opacity: .65;
+  background:
+    radial-gradient(circle at 90% 10%, rgba(255,49,88,.12) 0 2px, transparent 2.5px),
+    linear-gradient(135deg, transparent 0 60%, rgba(37,124,255,.07) 60% 61%, transparent 61%);
+}
+
+/* ── Smooth mobile sidebar: transform + opacity, never display:none ── */
+@media screen and (max-width: 768px) {
+  body.sidebar-open { overflow: hidden; }
+
+  .sidebar {
+    left: 0 !important;
+    transform: translate3d(-105%, 0, 0) !important;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    will-change: transform, opacity;
+    transition:
+      transform .42s cubic-bezier(.22,.85,.25,1),
+      opacity .28s ease,
+      visibility 0s linear .42s !important;
+  }
+
+  .sidebar.open {
+    left: 0 !important;
+    transform: translate3d(0, 0, 0) !important;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition:
+      transform .42s cubic-bezier(.22,.85,.25,1),
+      opacity .28s ease,
+      visibility 0s linear 0s !important;
+    box-shadow: 16px 0 55px rgba(0,0,0,.42), 8px 0 0 rgba(255,49,88,.05);
+  }
+
+  .sidebar-overlay {
+    display: block !important;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    background: rgba(3,5,12,.72);
+    backdrop-filter: blur(0px);
+    -webkit-backdrop-filter: blur(0px);
+    transition:
+      opacity .32s ease,
+      backdrop-filter .42s ease,
+      -webkit-backdrop-filter .42s ease,
+      visibility 0s linear .32s;
+  }
+
+  .sidebar-overlay.show {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+    transition:
+      opacity .32s ease,
+      backdrop-filter .42s ease,
+      -webkit-backdrop-filter .42s ease,
+      visibility 0s linear 0s;
+  }
+
+  .mobile-menu {
+    transition: transform .2s ease, background .2s ease, border-color .2s ease;
+  }
+  .mobile-menu:active { transform: scale(.9) rotate(-3deg); }
+}
+
+@keyframes comicWiggle {
+  0%, 100% { transform: rotate(10deg) scale(1); }
+  50% { transform: rotate(7deg) scale(1.035); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comic-burst { animation: none !important; }
+  .sidebar, .sidebar.open, .sidebar-overlay, .sidebar-overlay.show { transition: none !important; }
+}
