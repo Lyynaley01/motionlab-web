@@ -10,6 +10,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
+  <!-- Cloudflare Turnstile -->
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
   <div class="noise"></div>
@@ -203,6 +205,11 @@
               <button type="button" id="pasteBtn" class="paste-btn">Paste</button>
             </div>
             <div class="form-hint"><span>ⓘ</span> Link video publik TikTok, termasuk vt.tiktok.com.</div>
+
+            <!-- ▼▼▼ TURNSTILE WIDGET ▼▼▼ -->
+            <div class="cf-turnstile" data-sitekey="GANTI_DENGAN_SITE_KEY_KAMU" data-theme="dark" data-size="flexible" style="margin: 14px 0;"></div>
+            <!-- ▲▲▲ TURNSTILE WIDGET ▲▲▲ -->
+
             <button class="btn btn-primary btn-wide" id="finderSubmit" type="submit">Find preset <span>⌕</span></button>
           </form>
 

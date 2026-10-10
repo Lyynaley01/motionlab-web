@@ -63,28 +63,43 @@
     toast.timer = setTimeout(() => el.classList.remove('show'), 2800);
   }
 
-  /* ── Page token: single-use, di-fetch fresh setiap kali submit ──
-     Token lama langsung hangus setelah satu request ke /api/_/s.
-     Turnstile token (X-Ts) diambil dari widget kalau tersedia.   */
-  async function getFreshToken() {
-    /* Ambil Turnstile token kalau widget ada di halaman */
-    let tsToken = '';
-    if (window.turnstile) {
-      try {
-        tsToken = await new Promise((resolve, reject) => {
-          const widgetId = window._tsWidgetId;
-          if (widgetId != null) {
-            const t = window.turnstile.getResponse(widgetId);
-            if (t) { window.turnstile.reset(widgetId); resolve(t); return; }
-          }
-          reject(new Error('no widget'));
-        });
-      } catch { tsToken = ''; }
+  /* ── Ambil token Turnstile dari widget ── */
+  function getTurnstileToken() {
+    if (!window.turnstile) return '';
+    const widget = document.querySelector('.cf-turnstile');
+    if (!widget) return '';
+    const widgetId = widget.getAttribute('data-widget-id');
+    if (widgetId != null) {
+      try { return window.turnstile.getResponse(widgetId) || ''; } catch { return ''; }
     }
-    const headers = { 'Accept': 'application/json' };
-    if (tsToken) headers['X-Ts'] = tsToken;
+    // fallback: ambil dari input hidden
+    const input = document.querySelector('[name="cf-turnstile-response"]');
+    return input ? input.value : '';
+  }
+
+  function resetTurnstile() {
+    if (!window.turnstile) return;
+    const widget = document.querySelector('.cf-turnstile');
+    if (!widget) return;
+    const widgetId = widget.getAttribute('data-widget-id');
+    if (widgetId != null) {
+      try { window.turnstile.reset(widgetId); } catch {}
+    }
+  }
+
+  /* ── Page token: single-use, di-fetch fresh setiap kali submit ── */
+  async function getFreshToken() {
+    const tsToken = getTurnstileToken();
+    if (!tsToken) {
+      throw new Error('Selesaikan verifikasi keamanan dulu (centang Turnstile).');
+    }
+    const headers = { 'Accept': 'application/json', 'X-Ts': tsToken };
     const r = await fetch('/api/_/init', { headers });
-    if (!r.ok) throw new Error('Gagal mendapatkan sesi. Muat ulang halaman.');
+    if (!r.ok) {
+      let msg = 'Gagal mendapatkan sesi. Muat ulang halaman.';
+      try { const e = await r.json(); if (e?.error) msg = e.error; } catch {}
+      throw new Error(msg);
+    }
     const d = await r.json();
     if (!d.pt) throw new Error('Token sesi tidak valid.');
     return d.pt;
@@ -103,9 +118,8 @@
     return data;
   }
 
-  /* apiFinder: ambil fresh token dulu, inject ke header, lalu POST */
   async function apiFinder(path, body) {
-    const pt  = await getFreshToken();
+    const pt = await getFreshToken();
     const res = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Pt': pt },
@@ -176,8 +190,6 @@
         throw new Error('Preset tidak ditemukan untuk video ini.');
       }
 
-      /* ── Only consume the server's whitelisted DTO. ──
-         The browser must never depend on provider media URLs. */
       const video  = data.video && typeof data.video === 'object' ? data.video : {};
       const author = data.authorDetail && typeof data.authorDetail === 'object' ? data.authorDetail : {};
 
@@ -314,11 +326,9 @@
 
       if (videoSection.childElementCount) finderResult.append(videoSection);
 
-      /* ── Author card ── */
       const authorCard = document.createElement('div');
       authorCard.className = 'author-card';
 
-      /* resolve username — try every field the proxy might use */
       const rawAuthor =
         (typeof data.author === 'string' ? data.author : '') ||
         data.username || data.user || data.creator ||
@@ -329,7 +339,6 @@
 
       const avatarEl = document.createElement('div');
       avatarEl.className = 'author-avatar';
-      /* TikTok avatar URLs are also CORS-blocked — use initial fallback */
       const avatarUrl = author.avatar || author.avatarUrl || author.avatar_url || '';
       if (avatarUrl) {
         const avatarImg = document.createElement('img');
@@ -362,24 +371,17 @@
       authorCard.append(avatarEl, infoEl);
       finderResult.append(authorCard);
 
-      /* ── Preset links section ──
-         The proxy may return: data.presetLinks, data.links, data.presets, data.data
-         Filter out junk entries whose title is literally "url", "thumb", etc.
-         Those are internal API artifacts injected by amfinder, not real presets. */
       const JUNK_TITLES = new Set(['url', 'thumb', 'thumbnail', 'cover', 'image']);
       const rawLinks = Array.isArray(data.presetLinks) ? data.presetLinks : [];
       const presetLinks = rawLinks.filter(l => {
         if (!l || !l.url) return false;
         const t = String(l.title || '').toLowerCase().trim();
-        /* reject bare junk keys */
         if (JUNK_TITLES.has(t)) return false;
-        /* reject items whose "url" field is actually a thumbnail CDN (not a preset link) */
         if (/\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(l.url)) return false;
         return true;
       });
 
       if (presetLinks.length) {
-        /* heading row with count pill */
         const headRow = document.createElement('div');
         headRow.className = 'finder-preset-head';
         headRow.innerHTML = `
@@ -395,12 +397,10 @@
         presetLinks.forEach(item => {
           const kind   = String(item.type || '').toLowerCase();
           const isXml  = kind === 'xml';
-          const is5mb  = kind === '5mb';
 
           const card = document.createElement('div');
           card.className = 'finder-preset-card';
 
-          /* ── left: thumbnail ── */
           const thumbEl = document.createElement('div');
           thumbEl.className = 'finder-preset-thumb';
 
@@ -425,11 +425,9 @@
           }
           card.append(thumbEl);
 
-          /* ── right: body ── */
           const body = document.createElement('div');
           body.className = 'finder-preset-body';
 
-          /* title row: name + badges */
           const titleRow = document.createElement('div');
           titleRow.className = 'finder-preset-title-row';
 
@@ -453,7 +451,6 @@
           titleRow.append(badgesEl);
           body.append(titleRow);
 
-          /* source (@detail) */
           if (item.detail) {
             const sourceEl = document.createElement('div');
             sourceEl.className = 'finder-preset-source';
@@ -461,13 +458,11 @@
             body.append(sourceEl);
           }
 
-          /* url display */
           const urlEl = document.createElement('div');
           urlEl.className = 'finder-preset-url';
           urlEl.textContent = truncUrl(item.url);
           body.append(urlEl);
 
-          /* action buttons */
           const btnRow = document.createElement('div');
           btnRow.className = 'finder-preset-btns';
 
@@ -526,6 +521,8 @@
     } finally {
       finderLoading.classList.remove('show');
       finderSubmit.disabled = false;
+      /* reset Turnstile biar bisa dipakai request berikutnya */
+      resetTurnstile();
     }
   });
 
