@@ -40,9 +40,25 @@ app.use((req, res, next) => {
 });
 
 const baseLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: Number(process.env.API_RATE_LIMIT || 30), standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Terlalu banyak request. Coba lagi beberapa saat.' } });
-const ampremLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: Number(process.env.AMPREM_RATE_LIMIT || 6), standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Batas Amprem tercapai. Coba lagi nanti.' } });
-const finderLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: Number(process.env.FINDER_RATE_LIMIT || 12), standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Batas pencarian tercapai. Coba lagi nanti.' } });
-app.use('/api', baseLimit);
+const AMPREM_COOLDOWN_MS = 5 * 60 * 1000;
+const ampremCooldown = new Map();
+
+function ampremLimit(req, res, next) {
+  const key = req.ip;
+  const now = Date.now();
+  const lastRequest = ampremCooldown.get(key);
+  if (lastRequest && now - lastRequest < AMPREM_COOLDOWN_MS) {
+    const retryAfter = Math.ceil((AMPREM_COOLDOWN_MS - (now - lastRequest)) / 1000);
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: 'Amprem sedang cooldown. Coba lagi dalam 5 menit.', retryAfter });
+  }
+  ampremCooldown.set(key, now);
+  next();
+}
+app.use('/api', (req, res, next) => {
+  if (req.path === '/finder' || req.path === '/finder/video') return next();
+  return baseLimit(req, res, next);
+});
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'], index: 'index.html' }));
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -136,7 +152,7 @@ app.post('/api/amprem/verify-link', ampremLimit, async (req, res) => {
   }
 });
 
-app.post('/api/finder', finderLimit, async (req, res) => {
+app.post('/api/finder', async (req, res) => {
   const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'Masukkan URL video TikTok HTTPS yang valid.' });
   try {
@@ -238,7 +254,7 @@ app.post('/api/finder', finderLimit, async (req, res) => {
 
 /* Stream the provider's MP4 through our own origin so the browser never
    has to request an expiring provider URL directly. */
-app.get('/api/finder/video', finderLimit, async (req, res) => {
+app.get('/api/finder/video', async (req, res) => {
   const url = typeof req.query?.url === 'string' ? req.query.url.trim() : '';
   if (!validHttpsUrl(url)) return res.status(400).json({ error: 'URL video TikTok tidak valid.' });
   try {
