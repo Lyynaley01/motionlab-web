@@ -17,6 +17,18 @@ const FINDER_TOKEN_SECRET = process.env.FINDER_TOKEN_SECRET || crypto.randomByte
 const PAGE_TOKEN_SECRET   = process.env.PAGE_TOKEN_SECRET   || crypto.randomBytes(32).toString('hex');
 const TURNSTILE_SECRET    = process.env.TURNSTILE_SECRET_KEY || '';
 
+/* ─── DEBUG: log env saat startup ─────────────────────────────── */
+console.log('=== STARTUP DEBUG ===');
+console.log('NODE_ENV:', process.env.NODE_ENV);
+console.log('PORT:', PORT);
+console.log('ALLOWED_ORIGINS raw:', JSON.stringify(process.env.ALLOWED_ORIGINS));
+console.log('ALLOWED_ORIGINS parsed:', JSON.stringify(allowedOrigins));
+console.log('TURNSTILE_SECRET present?', !!TURNSTILE_SECRET);
+console.log('PAGE_TOKEN_SECRET present?', !!process.env.PAGE_TOKEN_SECRET);
+console.log('FINDER_TOKEN_SECRET present?', !!process.env.FINDER_TOKEN_SECRET);
+console.log('AM_FINDER_URL present?', !!process.env.AM_FINDER_URL);
+console.log('=====================');
+
 /* TTL: init token hidup 15 menit, sekali pakai */
 const INIT_TOKEN_TTL_MS = 15 * 60 * 1000;
 
@@ -29,10 +41,7 @@ setInterval(() => {
   }
 }, 20 * 60 * 1000);
 
-/* ─── Rate limiters ─────────────────────────────────────────────
-   /api/_/init: max 3 token per IP+UA per 15 menit (diperketat)
-   /api/_/s: max 20 per IP per 15 menit
-   endpoint lain: 30 per 15 menit                                  */
+/* ─── Rate limiters ─────────────────────────────────────────────── */
 const initLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 3,
@@ -123,15 +132,23 @@ function openPageToken(token) {
   } catch { return null; }
 }
 
-/* ─── Middleware: blokir curl/wget/python/UA kosong ─────────────
-   Browser asli selalu kirim User-Agent + Accept-Language.
-   curl/wget/axios/python-requests biasanya kosong atau pola khas. */
+/* ─── Middleware: blokir curl/wget/python/UA kosong ───────────── */
 function blockNonBrowser(req, res, next) {
   const ua = req.headers['user-agent'] || '';
+  const al = req.headers['accept-language'] || '';
+  console.log('=== [1] blockNonBrowser ===', {
+    path: req.path,
+    ua: ua.slice(0, 80),
+    acceptLanguage: al,
+    hasUA: !!ua,
+    hasAL: !!al
+  });
   if (!ua || /curl|wget|python|axios|node-fetch|httpclient|okhttp|go-http/i.test(ua)) {
+    console.log('=== [1] BLOCKED: UA curl/bot ===');
     return res.status(403).json({ error: 'Akses ditolak.' });
   }
-  if (!req.headers['accept-language']) {
+  if (!al) {
+    console.log('=== [1] BLOCKED: no Accept-Language ===');
     return res.status(403).json({ error: 'Akses ditolak.' });
   }
   next();
@@ -141,26 +158,47 @@ function blockNonBrowser(req, res, next) {
 function requirePageToken(req, res, next) {
   const raw     = typeof req.headers['x-pt'] === 'string' ? req.headers['x-pt'] : '';
   const payload = openPageToken(raw);
+  console.log('=== [2] requirePageToken ===', {
+    path: req.path,
+    hasToken: !!raw,
+    tokenLen: raw.length,
+    decoded: payload ? { jti: payload.jti?.slice(0, 8), ip: payload.ip, exp: payload.exp } : null,
+    currentIp: req.ip
+  });
   if (!payload || payload.exp < Date.now()) {
+    console.log('=== [2] BLOCKED: token invalid/expired ===');
     return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
   }
   if (!payload.jti || usedInitTokens.has(payload.jti)) {
+    console.log('=== [2] BLOCKED: token already used ===');
     return res.status(403).json({ error: 'Token sudah digunakan. Muat ulang halaman.' });
   }
   if (payload.ip && payload.ip !== req.ip) {
+    console.log('=== [2] BLOCKED: IP mismatch ===', { tokenIp: payload.ip, reqIp: req.ip });
     return res.status(403).json({ error: 'Sesi tidak valid. Muat ulang halaman.' });
   }
   usedInitTokens.set(payload.jti, payload.exp);
+  console.log('=== [2] PASS ===');
   next();
 }
 
 /* ─── Middleware: Cloudflare Turnstile ────────────────────────── */
 async function requireTurnstile(req, res, next) {
+  console.log('=== [3] requireTurnstile ===', {
+    path: req.path,
+    hasSecret: !!TURNSTILE_SECRET,
+    hasXs: !!req.headers['x-ts'],
+    xsLen: (req.headers['x-ts'] || '').length
+  });
   if (!TURNSTILE_SECRET) {
+    console.log('=== [3] BLOCKED: TURNSTILE_SECRET not set ===');
     return res.status(503).json({ error: 'Verifikasi belum dikonfigurasi.' });
   }
   const cfToken = typeof req.headers['x-ts'] === 'string' ? req.headers['x-ts'] : '';
-  if (!cfToken) return res.status(403).json({ error: 'Verifikasi diperlukan.' });
+  if (!cfToken) {
+    console.log('=== [3] BLOCKED: no X-Ts header ===');
+    return res.status(403).json({ error: 'Verifikasi diperlukan.' });
+  }
   try {
     const form = new URLSearchParams();
     form.append('secret',   TURNSTILE_SECRET);
@@ -170,9 +208,15 @@ async function requireTurnstile(req, res, next) {
       form.toString(),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 5000 }
     );
-    if (!r.data?.success) return res.status(403).json({ error: 'Verifikasi gagal. Coba lagi.' });
+    console.log('=== [3] Turnstile response ===', JSON.stringify(r.data));
+    if (!r.data?.success) {
+      console.log('=== [3] BLOCKED: Turnstile success=false ===', r.data?.['error-codes']);
+      return res.status(403).json({ error: 'Verifikasi gagal. Coba lagi.' });
+    }
+    console.log('=== [3] PASS ===');
     next();
-  } catch {
+  } catch (err) {
+    console.log('=== [3] BLOCKED: Turnstile request error ===', err.message);
     return res.status(503).json({ error: 'Layanan verifikasi tidak tersedia.' });
   }
 }
@@ -205,14 +249,31 @@ app.use((req, res, next) => {
   res.setHeader('Cache-Control', req.path.startsWith('/api/') ? 'no-store' : 'public, max-age=300');
 
   if (req.path.startsWith('/api/_')) {
-    const origin = req.get('origin') || req.get('referer') || '';
+    const origin  = req.get('origin')  || '';
+    const referer = req.get('referer') || '';
+    const check   = origin || referer;
+    const match   = allowedOrigins.some(o => check.startsWith(o));
+
+    console.log('=== [0] ORIGIN GUARD ===', JSON.stringify({
+      path: req.path,
+      method: req.method,
+      origin: origin,
+      referer: referer,
+      check: check,
+      allowedOrigins: allowedOrigins,
+      allowedCount: allowedOrigins.length,
+      match: match
+    }));
+
     if (!allowedOrigins.length) {
-      // kalau env belum di-set, tolak request API agar aman by default
+      console.log('=== [0] BLOCKED: no ALLOWED_ORIGINS set ===');
       return res.status(503).json({ error: 'Konfigurasi origin belum siap.' });
     }
-    if (!allowedOrigins.some(o => origin.startsWith(o))) {
+    if (!match) {
+      console.log('=== [0] BLOCKED: origin mismatch ===');
       return res.status(403).json({ error: 'Akses ditolak.' });
     }
+    console.log('=== [0] PASS ===');
   }
   next();
 });
@@ -285,6 +346,7 @@ app.get('/api/health', (_req, res) =>
 
 /* ── Init: issue single-use page token ────────────────────────── */
 app.get('/api/_/init', initLimit, blockNonBrowser, requireTurnstile, (req, res) => {
+  console.log('=== [4] /api/_/init SUCCESS — issuing token ===');
   const jti = crypto.randomBytes(16).toString('hex');
   const token = sealPageToken({
     jti,
